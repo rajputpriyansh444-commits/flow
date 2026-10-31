@@ -1,0 +1,38 @@
+// Package spec054_template_test covers template action wiring through the CLI.
+package spec054_template_test
+
+import (
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/conformance/harness"
+)
+
+func TestTemplateRender(t *testing.T) {
+	t.Parallel()
+	flow := harness.NewRunner(t)
+	flow.Run("start", "render.yaml").ExpectExitCode(0)
+	flow.ExpectFileContent("inline.txt", "literal: ${FOO}, rendered: bar")
+	flow.ExpectFileContent("reference.txt", "Hi Ref")
+	flow.ExpectFileContent("nested/dir/rendered.txt", "Hello, File!")
+}
+
+func TestTemplateErrors(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ command, file, message string }{
+		{"validate", "missing_both.yaml", "requires exactly one of with.template or with.template_ref"},
+		{"validate", "both_set.yaml", "requires exactly one of with.template or with.template_ref"},
+		{"validate", "bad_template_ref.yaml", "must be one complete scoped value reference"},
+		{"start", "missingkey.yaml", "map has no entry for key"},
+		{"validate", "parse_error.yaml", "template: parse error"},
+		{"validate", "missing_dot.yaml", `"report" is a with.data key and needs a leading dot`},
+		{"validate", "unknown_field.yaml", `unexpected additional properties ["datas"]; did you mean "data" instead of "datas"?`},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			t.Parallel()
+			flow := harness.NewRunner(t)
+			result := flow.Run(tc.command, tc.file)
+			result.ExpectNonZeroExitCode()
+			result.ExpectStderrContains(tc.message)
+		})
+	}
+}

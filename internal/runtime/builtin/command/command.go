@@ -1,0 +1,468 @@
+package command
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/cmdutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/fileutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger/tag"
+	cmnvalue "github.com/rajputpriyansh444-commits/flow/internal/cmn/value"
+	"github.com/rajputpriyansh444-commits/flow/internal/executor/registry"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime/executor"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime/resourcelimit"
+)
+
+var errNoCommandSpecified = fmt.Errorf("no command specified")
+
+// errStoppedBeforeStart reports a step stopped before its command started.
+var errStoppedBeforeStart = errors.New("step stopped before its command started")
+
+var _ executor.Executor = (*commandExecutor)(nil)
+var _ executor.Stopper = (*commandExecutor)(nil)
+var _ executor.ExitCoder = (*commandExecutor)(nil)
+
+type commandExecutor struct {
+	mu         sync.Mutex
+	config     *commandConfig
+	process    *cmdutil.ManagedProcess
+	scriptFile string
+	exitCode   int
+	// stoppedBeforeStart records a termination requested before the process
+	// existed, so Run does not start the command afterwards.
+	stoppedBeforeStart bool
+	// stderrTail stores a rolling tail of recent stderr lines
+	stderrTail *executor.TailWriter
+}
+
+// ExitCode implements ExitCoder.
+func (e *commandExecutor) ExitCode() int {
+	return e.exitCode
+}
+
+func (e *commandExecutor) Run(ctx context.Context) error {
+	e.mu.Lock()
+
+	// Run holds the lock until the process exists, so a stop either lands
+	// here or reaches the started process.
+	if e.stoppedBeforeStart {
+		e.mu.Unlock()
+		return errStoppedBeforeStart
+	}
+
+	if e.config.Script != "" {
+		scriptFile, err := setupScriptForExecution(e.config.Dir, e.config.Script, e.config.Command, e.config.Shell, e.config.UserSpecifiedShell)
+		if err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("failed to setup script: %w", err)
+		}
+		e.scriptFile = scriptFile
+		defer func() {
+			_ = fileutil.Remove(scriptFile)
+		}()
+	}
+	// Wrap stderr with a tailing writer so we can include recent
+	// stderr output (rolling, up to limit) in error messages.
+	// Use encoding from DAGContext to properly decode non-UTF-8 output.
+	env := runtime.GetEnv(ctx)
+	tw := executor.NewTailWriterWithEncoding(e.config.Stderr, 0, env.LogEncodingCharset)
+	e.stderrTail = tw
+	e.config.Stderr = tw
+
+	// Ensure the working directory exists. This precedes opening the stdin
+	// file because a relative stdin path resolves against it.
+	if e.config.Dir != "" {
+		if err := os.MkdirAll(e.config.Dir, 0750); err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("failed to create working directory: %w", err)
+		}
+	}
+
+	// Open the stdin file, if configured, so its contents are piped to the
+	// command's standard input.
+	if e.config.StdinPath != "" {
+		stdinPath, err := resolveStdinPath(e.config.StdinPath, e.config.Dir)
+		if err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		stdin, err := os.Open(stdinPath)
+		if err != nil {
+			e.mu.Unlock()
+			return fmt.Errorf("failed to open stdin file %q: %w", stdinPath, err)
+		}
+		defer func() { _ = stdin.Close() }()
+		e.config.Stdin = stdin
+	}
+
+	cmd, err := e.config.newCmd(ctx, e.scriptFile)
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("failed to create command: %w", err)
+	}
+
+	process, err := cmdutil.StartManagedProcess(cmd)
+	if err != nil {
+		e.exitCode = exitCodeFromError(err)
+		e.mu.Unlock()
+		if tail := e.stderrTail.Tail(); tail != "" {
+			tail = e.annotateStderrTail(tail)
+			return fmt.Errorf("%w\nrecent stderr (tail):\n%s", err, tail)
+		}
+		return err
+	}
+	e.process = process
+	if guard := resourcelimit.FromContext(ctx); guard != nil {
+		if err := guard.AssignProcess(process.PID()); err != nil {
+			logger.Warn(ctx, "Resource limits requested but process assignment failed", tag.Error(err))
+		}
+	}
+	e.mu.Unlock()
+	defer func() { _ = process.Release() }()
+
+	// Wait for the command to finish or the context to be cancelled.
+	// This ensures timeout is enforced even if cmd.Wait() blocks due to
+	// stuck I/O or unkillable child processes.
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- process.Wait()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context cancelled (timeout or manual cancellation)
+		// Kill the process to ensure it doesn't hang
+		_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonTimeout})
+		// Wait for cmd.Wait() to return after killing
+		<-waitDone
+		e.exitCode = 124 // Standard timeout exit code
+		return ctx.Err()
+	case err := <-waitDone:
+		if err != nil {
+			e.exitCode = exitCodeFromError(err)
+			if tail := e.stderrTail.Tail(); tail != "" {
+				tail = e.annotateStderrTail(tail)
+				return fmt.Errorf("%w\nrecent stderr (tail):\n%s", err, tail)
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+func (e *commandExecutor) SetStdout(out io.Writer) {
+	e.config.Stdout = out
+}
+
+func (e *commandExecutor) SetStderr(out io.Writer) {
+	e.config.Stderr = out
+}
+
+func (e *commandExecutor) Kill(sig os.Signal) error {
+	return e.Stop(cmdutil.TerminationFromSignal(sig))
+}
+
+func (e *commandExecutor) Stop(intent cmdutil.TerminationIntent) error {
+	return e.stop(cmdutil.StopRequest{Intent: intent})
+}
+
+func (e *commandExecutor) stop(req cmdutil.StopRequest) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.process == nil {
+		// A signal for a process that does not exist yet cannot be
+		// delivered; only a termination is kept, as a reason not to start.
+		if req.Intent.IsTermination() {
+			e.stoppedBeforeStart = true
+		}
+		return nil
+	}
+	_, err := e.process.Stop(req)
+	return err
+}
+
+// resolveStdinPath expands a leading tilde and anchors a relative path to the
+// step working directory.
+func resolveStdinPath(path, dir string) (string, error) {
+	if strings.HasPrefix(path, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to expand %q: %w", path, err)
+		}
+		return filepath.Join(home, path[1:]), nil
+	}
+	if dir != "" && !filepath.IsAbs(path) {
+		return filepath.Join(dir, path), nil
+	}
+	return path, nil
+}
+
+// annotateStderrTail returns a cleaned version of the tail with the temp script
+// path stripped for use in the error field.
+func (e *commandExecutor) annotateStderrTail(tail string) string {
+	if e.config.Script == "" || e.scriptFile == "" {
+		return tail
+	}
+
+	// Strip temp script path from stderr for clean display.
+	// e.g. "/tmp/flow_script-123.sh:3: not found" → "line 3: not found"
+	baseName := filepath.Base(e.scriptFile)
+	cleaned := strings.ReplaceAll(tail, e.scriptFile+":", "line ")
+	cleaned = strings.ReplaceAll(cleaned, baseName+":", "line ")
+	cleaned = strings.ReplaceAll(cleaned, e.scriptFile+": ", "")
+	cleaned = strings.ReplaceAll(cleaned, baseName+": ", "")
+
+	return cleaned
+}
+
+type commandConfig struct {
+	Ctx              context.Context
+	Dir              string
+	Command          string
+	Args             []string
+	Script           string
+	Shell            []string // Shell command and arguments, e.g., ["/bin/sh", "-e"]
+	ShellCommandArgs string   // The command string to execute via shell -c
+	ShellPackages    []string // Packages for nix-shell
+	Stdout           io.Writer
+	Stderr           io.Writer
+	// StdinPath is the resolved path of the file piped to the command's stdin.
+	StdinPath          string
+	Stdin              io.Reader
+	UserSpecifiedShell bool
+}
+
+func (cfg *commandConfig) newCmd(ctx context.Context, scriptFile string) (*exec.Cmd, error) {
+	if scriptFile == "" && cfg.ShellCommandArgs != "" && strings.ContainsAny(cfg.ShellCommandArgs, "\r\n") {
+		return nil, fmt.Errorf("resolved command text contains a line break")
+	}
+
+	var cmd *exec.Cmd
+	switch {
+	case cfg.Command != "" && scriptFile != "":
+		cmdBuilder := &shellCommandBuilder{
+			Dir:                cfg.Dir,
+			Command:            cfg.Command,
+			Args:               cfg.Args,
+			Shell:              cfg.Shell,
+			ShellCommandArgs:   cfg.ShellCommandArgs,
+			ShellPackages:      cfg.ShellPackages,
+			Script:             scriptFile,
+			UserSpecifiedShell: cfg.UserSpecifiedShell,
+		}
+		c, err := cmdBuilder.Build(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cmd = c
+
+	case len(cfg.Shell) > 0 && scriptFile != "":
+		// Check if the resolved script has a shebang and the step did not force a shell.
+		shebang, shebangArgs, err := cfg.detectShebang()
+		if err != nil {
+			return nil, fmt.Errorf("failed to detect shebang: %w", err)
+		}
+		if shebang != "" {
+			shebangPath, err := resolveShebangExecutable(ctx, shebang)
+			if err != nil {
+				return nil, err
+			}
+			cmd = exec.CommandContext(cfg.Ctx, shebangPath, append(shebangArgs, scriptFile)...) // nolint: gosec
+			cmdutil.SetupCommand(cmd)
+			break
+		}
+		// Use shell command builder to properly execute the script file
+		// This ensures each shell type uses the correct flags (e.g., cmd.exe /c, powershell -File)
+		cmdBuilder := &shellCommandBuilder{
+			Dir:                cfg.Dir,
+			Shell:              cfg.Shell,
+			ShellPackages:      cfg.ShellPackages,
+			Script:             scriptFile,
+			UserSpecifiedShell: cfg.UserSpecifiedShell,
+		}
+		c, err := cmdBuilder.Build(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cmd = c
+
+	case len(cfg.Shell) > 0 && cfg.ShellCommandArgs != "":
+		cmdBuilder := &shellCommandBuilder{
+			Dir:                cfg.Dir,
+			Command:            cfg.Command,
+			Args:               cfg.Args,
+			Shell:              cfg.Shell,
+			ShellCommandArgs:   cfg.ShellCommandArgs,
+			ShellPackages:      cfg.ShellPackages,
+			UserSpecifiedShell: cfg.UserSpecifiedShell,
+		}
+		c, err := cmdBuilder.Build(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cmd = c
+
+	default:
+		command := cfg.Command
+		args := cfg.Args
+		if command == "" {
+			// No command specified, fallback to shell
+			env := runtime.GetEnv(ctx)
+			shell := env.Shell(ctx)
+			if len(shell) == 0 {
+				return nil, errNoCommandSpecified
+			}
+			command = shell[0]
+			tmp := make([]string, len(shell)-1)
+			copy(tmp, shell[1:])
+			args = append(tmp, args...)
+		}
+		command = resolveRuntimeToolCommand(ctx, command)
+		cmd = createDirectCommand(cfg.Ctx, command, args, scriptFile)
+	}
+
+	cmd.Env = append(cmd.Env, runtime.AllEnvs(ctx)...)
+	cmd.Dir = cfg.Dir
+	cmd.Stdin = cfg.Stdin
+	cmd.Stdout = cfg.Stdout
+	cmd.Stderr = cfg.Stderr
+	cmdutil.SetupCommand(cmd)
+
+	return cmd, nil
+}
+
+func (cfg *commandConfig) detectShebang() (string, []string, error) {
+	if cfg.UserSpecifiedShell {
+		return "", nil, nil
+	}
+	return parseScriptShebang(cfg.Script)
+}
+
+// exitCodeFromError returns the process exit code represented by err.
+// 0 if err is nil; if err is an *exec.ExitError (or wraps one) returns its ExitCode(); otherwise returns 1.
+func exitCodeFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		return exitErr.ExitCode()
+	}
+	return 1
+}
+
+// NewCommand creates an executor that will run the provided step.
+// It returns an executor configured from the step, or an error if creating the command configuration fails.
+// If the step has multiple commands, it returns a multiCommandExecutor that runs them sequentially.
+func NewCommand(ctx context.Context, step ir.Step) (executor.Executor, error) {
+	// If there are multiple commands, use the multi-command executor
+	if len(step.Commands) > 1 {
+		return newMultiCommandExecutor(ctx, step)
+	}
+
+	cfg, err := NewCommandConfig(ctx, step)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create command: %w", err)
+	}
+
+	return &commandExecutor{config: cfg}, nil
+}
+
+// NewCommandConfig creates a commandConfig populated from the given context and step.
+// The returned config uses the environment from runtime.GetEnv(ctx) for Dir and Shell,
+// extracts Command/Args from the first command entry, and sets UserSpecifiedShell to true
+// when the step explicitly provided a Shell.
+// It returns the constructed *commandConfig and a nil error.
+func NewCommandConfig(ctx context.Context, step ir.Step) (*commandConfig, error) {
+	env := runtime.GetEnv(ctx)
+
+	var command string
+	var args []string
+	var shellCmdArgs string
+
+	// Extract command and args from the first command entry
+	if len(step.Commands) > 0 {
+		command = step.Commands[0].Command
+		args = step.Commands[0].Args
+		shellCmdArgs = step.Commands[0].CmdWithArgs
+	}
+
+	// Fall back to step-level ShellCmdArgs if not set in command entry
+	if shellCmdArgs == "" {
+		shellCmdArgs = step.ShellCmdArgs
+	}
+
+	return &commandConfig{
+		Ctx:                ctx,
+		Dir:                env.WorkingDir,
+		Command:            command,
+		Args:               args,
+		Script:             step.Script,
+		Shell:              env.Shell(ctx),
+		ShellCommandArgs:   shellCmdArgs,
+		ShellPackages:      step.ShellPackages,
+		StdinPath:          step.Stdin,
+		UserSpecifiedShell: step.Shell != "",
+	}, nil
+}
+
+// init registers command executors ("", "shell", "command") with the executor
+// framework, associating each with NewCommand and validateCommandStep.
+func init() {
+	caps := registry.ExecutorCapabilities{
+		Command:          true,
+		MultipleCommands: true,
+		Script:           true,
+		Shell:            true,
+		Stdin:            true,
+		CommandContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
+			shell := commandContextShell(ctx, step)
+			return cmnvalue.CommandContext{
+				Target:          cmnvalue.CommandTargetLocal,
+				Shell:           shell,
+				ShellConfigured: len(shell) > 0,
+			}
+		},
+		ScriptContext: func(ctx context.Context, step ir.Step) cmnvalue.CommandContext {
+			shell := commandContextShell(ctx, step)
+			return cmnvalue.CommandContext{
+				Target:          cmnvalue.CommandTargetLocal,
+				Shell:           shell,
+				ShellConfigured: len(shell) > 0,
+			}
+		},
+	}
+	executor.RegisterExecutor("", NewCommand, validateCommandStep, caps)
+	executor.RegisterExecutor("shell", NewCommand, validateCommandStep, caps)
+	executor.RegisterExecutor("command", NewCommand, validateCommandStep, caps)
+}
+
+func commandContextShell(ctx context.Context, step ir.Step) []string {
+	if env, ok := runtime.LookupEnv(ctx); ok {
+		return env.Shell(ctx)
+	}
+	if _, ok := runtime.LookupDAGContext(ctx); ok {
+		return runtime.NewEnv(ctx, step).Shell(ctx)
+	}
+	if step.Shell != "" {
+		shell := []string{step.Shell}
+		return append(shell, step.ShellArgs...)
+	}
+	shellCmd := cmdutil.GetShellCommand(config.GetConfig(ctx).Core.DefaultShell)
+	if shellCmd == "" {
+		return nil
+	}
+	shell := []string{shellCmd}
+	return append(shell, step.ShellArgs...)
+}

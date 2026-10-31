@@ -1,0 +1,6 @@
+secrets:
+  - name: MY_SECRET
+    provider: env
+    key: FLOW_CONFORMANCE_UNSET_SECRET_VAR
+steps:
+  - command: echo hi

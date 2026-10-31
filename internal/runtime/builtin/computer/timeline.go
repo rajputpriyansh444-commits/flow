@@ -1,0 +1,28 @@
+package computer
+
+import (
+	"fmt"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/computerhost"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime/builtin/internal/agentstep"
+)
+
+const (
+	// providerName identifies computer steps in agent sessions.
+	providerName = computerhost.AgentProvider
+	// artifactsSubdir holds the screenshots of computer steps in the run
+	// artifacts directory.
+	artifactsSubdir = "computer"
+
+	// Reasons a computer step waits, which name its waiting timeline events:
+	// another step holds the desktop, a person is using it, or the screen
+	// is locked until a person unlocks it.
+	waitReasonDesktop = "desktop"
+	waitReasonPerson  = "person"
+	waitReasonScreen  = "screen"
+)
+
+// logAction logs one desktop action of the operation at index.
+func logAction(t *agentstep.Timeline, index int, description string) {
+	_, _ = fmt.Fprintf(t.Log, "%s   %s\n", t.Position(index), t.Masker.MaskString(description))
+}

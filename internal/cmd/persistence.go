@@ -1,0 +1,125 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/agentsession"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/fileutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/dagrun"
+	"github.com/rajputpriyansh444-commits/flow/internal/dispatch"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis/file"
+	fileartifact "github.com/rajputpriyansh444-commits/flow/internal/persis/file/artifact"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis/store"
+	"github.com/rajputpriyansh444-commits/flow/internal/queue"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime/workspacebundle"
+	"github.com/rajputpriyansh444-commits/flow/internal/schedulerstate"
+	"github.com/rajputpriyansh444-commits/flow/internal/serviceregistry"
+)
+
+// Persistence contains the persistence dependencies shared by commands and services.
+type Persistence struct {
+	DAGRepository             *persis.DAGRepository
+	DAGRunRepository          *persis.DAGRunRepository
+	ArtifactRepository        *persis.ArtifactRepository
+	ProcRepository            *persis.ProcRepository
+	QueueStore                queue.QueueStore
+	StateStore                dagrun.StateStore
+	SchedulerStateStore       schedulerstate.Store
+	SchedulerPauseStore       schedulerstate.PauseStore
+	WatchStateStore           schedulerstate.WatchStore
+	ServiceRegistry           serviceregistry.ServiceRegistry
+	DispatchTaskStore         dispatch.DispatchTaskStore
+	WorkerHeartbeatStore      dispatch.WorkerHeartbeatStore
+	DAGRunLeaseStore          dispatch.DAGRunLeaseStore
+	ActiveDistributedRunStore dispatch.ActiveDistributedRunStore
+	AgentSessionCleanupQueue  *agentsession.CleanupQueue
+}
+
+type filePersistenceOptions struct {
+	DAGCache            *fileutil.Cache[*ir.DAG]
+	DAGRunStatusCache   *fileutil.Cache[*ir.DAGRunStatus]
+	ArtifactRecordCache *fileutil.Cache[*fileartifact.Record]
+}
+
+func newFilePersistence(
+	ctx context.Context,
+	cfg *config.Config,
+	backend persis.Backend,
+	opts filePersistenceOptions,
+) (Persistence, error) {
+	procRepository := file.NewProcRepository(cfg)
+	if err := procRepository.Validate(ctx); err != nil {
+		return Persistence{}, fmt.Errorf("failed to validate proc directory %s: %w", cfg.Paths.ProcDir, err)
+	}
+
+	cleanupQueue := agentsession.NewCleanupQueue(
+		backend.Collection(persis.CollectionAgentSessionCleanups),
+	)
+	var dagRunOpts []file.DAGRunRepositoryOption
+	if opts.DAGRunStatusCache != nil {
+		dagRunOpts = append(dagRunOpts, file.WithDAGRunHistoryFileCache(opts.DAGRunStatusCache))
+	}
+	dagRunOpts = append(dagRunOpts, file.WithDAGRunRemovalEnqueuer(cleanupQueue))
+	dagRunRepository := file.NewDAGRunRepository(cfg, dagRunOpts...)
+
+	var artifactOpts []file.ArtifactRepositoryOption
+	if opts.ArtifactRecordCache != nil {
+		artifactOpts = append(artifactOpts, file.WithArtifactRecordCache(opts.ArtifactRecordCache))
+	}
+	artifactRepository := file.NewArtifactRepository(cfg, artifactOpts...)
+
+	dagRunLeaseStore := store.NewDAGRunLeaseStore(
+		backend.Collection(persis.CollectionDAGRunLeases),
+	)
+	activeDistributedRunStore := store.NewActiveDistributedRunStore(
+		backend.Collection(persis.CollectionActiveDistributedRuns),
+	)
+	queueStore := store.NewQueueStore(backend.Collection(persis.CollectionQueue))
+	stateStore := store.NewDAGStateStore(backend.Collection(persis.CollectionDAGState))
+	schedulerStateStore := store.NewSchedulerStateStore(
+		backend.Collection(persis.CollectionSchedulerState),
+	)
+	schedulerPauseStore := store.NewSchedulerPauseStore(
+		backend.Collection(persis.CollectionSchedulerState),
+	)
+	watchStateStore := store.NewWatchStateStore(backend.Collection(persis.CollectionWatchState))
+	serviceRegistry := file.NewServiceRegistry(cfg)
+	bundleStore := workspacebundle.NewStore(
+		workspacebundle.StoreDir(cfg.Paths.DataDir),
+		workspacebundle.DefaultLimits(),
+	)
+	dispatchTaskStore := store.NewDispatchTaskStore(
+		backend.Collection(persis.CollectionDispatchTasks),
+		store.WithDispatchAdmissionLiveness(dagRunLeaseStore, activeDistributedRunStore),
+		store.WithDispatchTransitionLock(bundleStore.WithLock),
+	)
+	workerHeartbeatStore := store.NewWorkerHeartbeatStore(
+		backend.Collection(persis.CollectionWorkerHeartbeats),
+	)
+	dagRepository, err := newDAGRepository(cfg, dagRepositoryConfig{Cache: opts.DAGCache})
+	if err != nil {
+		return Persistence{}, fmt.Errorf("failed to create DAG store: %w", err)
+	}
+
+	return Persistence{
+		DAGRepository:             dagRepository,
+		DAGRunRepository:          dagRunRepository,
+		ArtifactRepository:        artifactRepository,
+		ProcRepository:            procRepository,
+		QueueStore:                queueStore,
+		StateStore:                stateStore,
+		SchedulerStateStore:       schedulerStateStore,
+		SchedulerPauseStore:       schedulerPauseStore,
+		WatchStateStore:           watchStateStore,
+		ServiceRegistry:           serviceRegistry,
+		DispatchTaskStore:         dispatchTaskStore,
+		WorkerHeartbeatStore:      workerHeartbeatStore,
+		DAGRunLeaseStore:          dagRunLeaseStore,
+		ActiveDistributedRunStore: activeDistributedRunStore,
+		AgentSessionCleanupQueue:  cleanupQueue,
+	}, nil
+}

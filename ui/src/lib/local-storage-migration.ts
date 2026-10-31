@@ -1,0 +1,26 @@
+export function readMigratedLocalStorage(
+  key: string,
+  legacyKey: string
+): string | null {
+  try {
+    const current = localStorage.getItem(key);
+    if (current !== null) return current;
+
+    const legacy = localStorage.getItem(legacyKey);
+    if (legacy !== null) writeLocalStorage(key, legacy);
+    return legacy;
+  } catch {
+    return null;
+  }
+}
+
+/** Stores value under key and reports whether the browser kept it. */
+export function writeLocalStorage(key: string, value: string): boolean {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    // Storage can be unavailable in privacy-restricted browser contexts.
+    return false;
+  }
+}

@@ -1,0 +1,158 @@
+package cmd
+
+import (
+	"fmt"
+	"log/slog"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger/tag"
+	"github.com/rajputpriyansh444-commits/flow/internal/intake"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/spf13/cobra"
+)
+
+// Enqueue returns the cobra command for queueing a DAG-run.
+func Enqueue() *cobra.Command {
+	return NewCommand(
+		&cobra.Command{
+			Use:   "enqueue [flags] <DAG definition> [-- param1 param2 ...]",
+			Short: "Enqueue a DAG-run to the queue.",
+			Long: `Enqueue a DAG-run to the queue.
+
+With --params-stdin, parameters can be provided on piped or redirected stdin
+(e.g. 'echo "P1=foo" | flow enqueue --params-stdin my_dag'). Input is read until
+EOF, up to 1 MiB. Arguments after "--" and --params take precedence.
+Quote individual stdin values to preserve spaces; "" supplies an empty value.
+Empty or whitespace-only stdin uses DAG defaults.
+Without --params-stdin, stdin is left unread.
+
+Examples:
+	echo '"hello world"' | flow enqueue --params-stdin my_dag
+	flow enqueue --run-id=run_id my_dag -- P1=foo P2=bar
+	flow enqueue --name my_custom_name my_dag.yaml -- P1=foo P2=bar
+`,
+			Args: cobra.MinimumNArgs(1),
+		}, enqueueFlags, runEnqueue,
+	)
+}
+
+var enqueueFlags = []commandLineFlag{paramsFlag, paramsStdinFlag, nameFlag, dagRunIDFlag, queueFlag, workerLabelFlag, labelsFlag, tagsFlag, defaultWorkingDirFlag, profileFlag, triggerTypeFlag, triggerActorFlag, scheduleTimeFlag, noReuseFlag}
+
+func runEnqueue(ctx *Context, args []string) error {
+	if ctx.IsRemote() {
+		return remoteRunEnqueue(ctx, args)
+	}
+	runID, err := ctx.StringParam("run-id")
+	if err != nil {
+		return fmt.Errorf("failed to get Run ID: %w", err)
+	}
+
+	if runID == "" {
+		runID, err = genRunID()
+		if err != nil {
+			return fmt.Errorf("failed to generate Run ID: %w", err)
+		}
+	} else if err := validateRunID(runID); err != nil {
+		return fmt.Errorf("invalid Run ID: %w", err)
+	}
+
+	queueOverride, err := ctx.StringParam("queue")
+	if err != nil {
+		return fmt.Errorf("failed to get queue override: %w", err)
+	}
+
+	dag, _, err := loadDAGWithParams(ctx, args, false)
+	if err != nil {
+		return err
+	}
+
+	if queueOverride != "" {
+		dag.Queue = queueOverride
+	}
+	if err := applyWorkerLabelsOverride(ctx, dag); err != nil {
+		return err
+	}
+
+	if err := parseAndAppendLabels(ctx, dag); err != nil {
+		return err
+	}
+
+	triggerType, err := parseTriggerTypeParam(ctx)
+	if err != nil {
+		return err
+	}
+	triggerActor, err := ctx.StringParam("trigger-actor")
+	if err != nil {
+		return fmt.Errorf("failed to get trigger actor: %w", err)
+	}
+
+	scheduleTime, err := parseScheduleTimeParam(ctx)
+	if err != nil {
+		return err
+	}
+	profileName, err := runtimeProfileNameParam(ctx)
+	if err != nil {
+		return err
+	}
+	noReuse, err := ctx.Command.Flags().GetBool("no-reuse")
+	if err != nil {
+		return fmt.Errorf("failed to read no-reuse: %w", err)
+	}
+
+	return enqueueDAGRun(ctx, dag, runID, runOptions{
+		triggerType:  triggerType,
+		triggerActor: triggerActor,
+		scheduleTime: scheduleTime,
+		profileName:  profileName,
+		definitionID: dagDefinitionIDFromEnv(),
+		noReuse:      noReuse,
+	})
+}
+
+// enqueueDAGRun enqueues a dag-run to the queue.
+// The DAG location is cleared to allow concurrent queued runs (location is used
+// for unix pipe generation which would prevent parallel execution).
+func enqueueDAGRun(ctx *Context, dag *ir.DAG, dagRunID string, opts runOptions) error {
+	dag.Location = ""
+
+	if !ctx.Config.Queues.Enabled {
+		return fmt.Errorf("queues are disabled in configuration")
+	}
+
+	dagRun := ir.NewDAGRunRef(dag.Name, dagRunID)
+
+	if _, err := ctx.Persistence.DAGRunRepository.FindAttempt(ctx, dagRun); err == nil {
+		return fmt.Errorf("DAG %q with ID %q already exists", dag.Name, dagRunID)
+	}
+
+	queued, err := intake.EnqueueRun(ctx.Context, intake.QueueRequest{
+		DAGRunRepository:        ctx.Persistence.DAGRunRepository,
+		QueueStore:              ctx.Persistence.QueueStore,
+		DAG:                     dag,
+		DAGRunID:                dagRunID,
+		LogBaseDir:              ctx.Config.Paths.LogDir,
+		ArtifactBaseDir:         ctx.Config.Paths.ArtifactDir,
+		TriggerType:             opts.triggerType,
+		TriggerActor:            opts.triggerActor,
+		ScheduleTime:            opts.scheduleTime,
+		ProfileName:             opts.profileName,
+		DefinitionID:            opts.definitionID,
+		NoReuse:                 opts.noReuse,
+		ProceedOnStatusCloseErr: true,
+	})
+	if err != nil {
+		return err
+	}
+	if queued.StatusCloseErr != nil {
+		logger.Warn(ctx.Context, "Failed to close queued status before enqueue",
+			tag.Error(queued.StatusCloseErr))
+	}
+
+	logger.Info(ctx.Context, "Enqueued dag-run",
+		tag.DAG(dag.Name),
+		tag.RunID(dagRunID),
+		slog.Any("params", dag.Params),
+	)
+
+	return nil
+}

@@ -1,0 +1,9 @@
+working_dir: .
+steps:
+  - name: write
+    action: exec
+    with:
+      command: ./write_arg
+      args:
+        - direct-process-env.txt
+        - $DIRECT_PROCESS_ONLY

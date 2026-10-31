@@ -1,0 +1,82 @@
+import { render, screen } from '@testing-library/react';
+import React from 'react';
+import { describe, expect, it } from 'vitest';
+import type { components } from '@/api/v1/schema';
+import DAGStepTableRow from '../DAGStepTableRow';
+
+describe('DAGStepTableRow', () => {
+  it('shows log step messages in the execution column', () => {
+    const step = {
+      name: 'announce',
+      executorConfig: {
+        type: 'log',
+        config: {
+          message: 'Deploying ${ENVIRONMENT}',
+        },
+      },
+    } as components['schemas']['Step'];
+
+    render(
+      <table>
+        <tbody>
+          <DAGStepTableRow step={step} index={0} />
+        </tbody>
+      </table>
+    );
+
+    expect(
+      screen.getByLabelText('Log message: Deploying ${ENVIRONMENT}')
+    ).toBeInTheDocument();
+  });
+
+  it('previews the script for harness steps', () => {
+    const step = {
+      name: 'review',
+      script: 'summarize the current branch',
+      commands: [
+        {
+          command: 'Review the repository',
+          args: [],
+        },
+      ],
+      executorConfig: {
+        type: 'harness',
+        config: {
+          provider: 'claude',
+        },
+      },
+    } as components['schemas']['Step'];
+
+    render(
+      <table>
+        <tbody>
+          <DAGStepTableRow step={step} index={0} />
+        </tbody>
+      </table>
+    );
+
+    expect(
+      screen.getByText('summarize the current branch')
+    ).toBeInTheDocument();
+    expect(screen.getByText('Review the repository')).toBeInTheDocument();
+  });
+
+  it('shows every alternative of an any-of precondition', () => {
+    const step = {
+      name: 'process',
+      preconditions: [
+        { condition: '${MODE}', expectedAny: ['full', 'minimal'] },
+      ],
+    } as components['schemas']['Step'];
+
+    render(
+      <table>
+        <tbody>
+          <DAGStepTableRow step={step} index={0} />
+        </tbody>
+      </table>
+    );
+
+    expect(screen.getByText('full | minimal')).toBeInTheDocument();
+  });
+});

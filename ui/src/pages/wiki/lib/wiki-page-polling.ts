@@ -1,0 +1,1 @@
+export const WIKI_SSE_FALLBACK_INTERVAL_MS = 30000;

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" translate="no">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/assets/favicon.ico" />
+    <title>Flow</title>
+    <script>
+      function getConfig() {
+        return {
+          apiURL: '/api/v1',
+          basePath: '',
+          title: 'Test Environment',
+          navbarColor: '',
+          version: 'dev',
+          tz: '',
+          tzOffsetInSec: undefined,
+          maxDashboardPageLimit: 100,
+          remoteNodes: 'local,dev,dev1',
+          initialWorkspaces: [],
+          permissions: {
+            writeDags: true,
+            runDags: true,
+          },
+          paths: {
+            configFileUsed: '~/.config/flow/config.yaml',
+            baseConfig: '~/.config/flow/base.yaml',
+            dagsDir: '~/.config/flow/dags',
+            logDir: '~/.local/share/flow/logs',
+            suspendFlagsDir: '~/.local/share/flow/suspend',
+            adminLogsDir: '~/.local/share/flow/logs/admin',
+            dagRunsDir: '~/.local/share/flow/data/dag-runs',
+            queueDir: '~/.local/share/flow/data/queue',
+            procDir: '~/.local/share/flow/data/proc',
+            serviceRegistryDir: '~/.local/share/flow/data/services',
+            usersDir: '~/.local/share/flow/data/users',
+            gitSyncDir: '~/.local/share/flow/data/gitsync',
+            auditLogsDir: '~/.local/share/flow/logs/admin/audit',
+          },
+          authMode: 'builtin',
+          setupRequired: false,
+          gitSyncEnabled: true,
+          agentEnabled: true,
+          oidcEnabled: false,
+          oidcButtonLabel: '',
+          proxyEnabled: false,
+          proxyButtonLabel: '',
+          terminalEnabled: true,
+          updateAvailable: true,
+          latestVersion: 'v2.0.0',
+          upgradeCommand: 'flow upgrade',
+          restartRequired: false,
+          restartCommand: '',
+          license: {
+            valid: false,
+            plan: '',
+            expiry: '',
+            features: [],
+            gracePeriod: false,
+            graceEndsAt: '',
+            community: true,
+            source: '',
+            warningCode: '',
+          },
+        };
+      }
+    </script>
+    <script>
+      // Apply the saved or system theme before the app loads so the page
+      // does not flash the other theme.
+      (function () {
+        var theme;
+        try {
+          theme = JSON.parse(localStorage.getItem('user_preferences') || '{}').theme;
+        } catch (e) {}
+        var dark =
+          theme === 'dark' ||
+          (theme !== 'light' &&
+            !!window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches);
+        var root = document.documentElement;
+        root.classList.toggle('dark', dark);
+        root.style.colorScheme = dark ? 'dark' : 'light';
+        root.style.backgroundColor = dark ? '#0b0d12' : '#f4f2ed';
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

@@ -1,0 +1,55 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+)
+
+// PrepareDAG validates, installs, and exposes the tools declared by a DAG.
+func PrepareDAG(ctx context.Context, dag *ir.DAG, installer Installer, opts InstallOptions, basePath string) ([]string, error) {
+	if dag == nil || dag.Tools == nil {
+		return nil, nil
+	}
+	if installer == nil {
+		return nil, fmt.Errorf("tools installer is required")
+	}
+	if err := ValidateDAGSupported(dag); err != nil {
+		return nil, err
+	}
+	logger.Info(ctx, "Preparing DAG tools", slog.Int("packages", len(dag.Tools.Packages)))
+	manifest, err := installer.Install(ctx, dag.Tools, opts)
+	if err != nil {
+		return nil, fmt.Errorf("prepare DAG tools: %w", err)
+	}
+	commands := 0
+	if manifest != nil {
+		commands = len(manifest.Commands)
+	}
+	logger.Info(ctx, "DAG tools ready", slog.Int("commands", commands))
+	return EnvVars(manifest, basePath), nil
+}
+
+// ValidateDAGSupported returns an error when DAG tools are declared for an
+// execution mode that cannot receive the host-local tool environment.
+func ValidateDAGSupported(dag *ir.DAG) error {
+	if dag == nil || dag.Tools == nil {
+		return nil
+	}
+	if dag.Container != nil {
+		return fmt.Errorf("tools are not supported with DAG-level container yet")
+	}
+	for _, step := range dag.Steps {
+		if step.Container != nil {
+			return fmt.Errorf("tools are not supported with step container %q yet", step.Name)
+		}
+		switch step.ExecutorConfig.Type {
+		case "docker", "ssh", "k8s", "kubernetes":
+			return fmt.Errorf("tools are not supported with executor %q on step %q yet", step.ExecutorConfig.Type, step.Name)
+		}
+	}
+	return nil
+}

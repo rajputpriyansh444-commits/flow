@@ -1,0 +1,360 @@
+package spec_test
+
+import (
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/executor/registry"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/spec"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestReferenceFieldsEmitsValidationPathSet(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{
+		Env:        []string{"ROOT=${consts.root}"},
+		Dotenv:     []string{"${consts.env_file}"},
+		Shell:      "${consts.shell}",
+		ShellArgs:  []string{"${consts.shell_arg}"},
+		WorkingDir: "${consts.workdir}",
+		Preconditions: []*ir.Condition{
+			{Condition: "${env.READY}"},
+			{Eval: "${params.root_eval}", Expected: "ready"},
+		},
+		Container: &ir.Container{
+			Exec:       "${consts.exec}",
+			Image:      "${consts.image}",
+			Name:       "${consts.name}",
+			User:       "${consts.user}",
+			WorkingDir: "${consts.container_dir}",
+			Network:    "${consts.network}",
+			Volumes:    []string{"${consts.volume}"},
+			Ports:      []string{"${consts.port}"},
+			Env:        []string{"ROOT=${env.ROOT}"},
+			Command:    []string{"${consts.command}"},
+			Shell:      []string{"${consts.shell}"},
+		},
+		SSH: &ir.SSHConfig{
+			User:          "${consts.ssh_user}",
+			Host:          "${params.ssh_host}",
+			Port:          "${consts.ssh_port}",
+			Key:           "${consts.ssh_key}",
+			Password:      "${env.SSH_PASSWORD}",
+			KnownHostFile: "${consts.known_hosts}",
+			Shell:         "${consts.ssh_shell}",
+			ShellArgs:     []string{"${consts.ssh_shell_arg}"},
+			Timeout:       "30s",
+			Bastion: &ir.BastionConfig{
+				Host:     "${consts.bastion_host}",
+				Port:     "${consts.bastion_port}",
+				User:     "${consts.bastion_user}",
+				Key:      "${consts.bastion_key}",
+				Password: "${env.BASTION_PASSWORD}",
+			},
+		},
+		Steps: []ir.Step{
+			{
+				ID:     "build",
+				Name:   "build",
+				Script: "${consts.script}",
+				Commands: []ir.CommandEntry{
+					{
+						Command:     "${consts.command}",
+						CmdWithArgs: "${consts.cmd_with_args}",
+						Args:        []string{"${consts.arg}"},
+					},
+				},
+				ExecutorConfig: ir.ExecutorConfig{
+					Config: map[string]any{
+						"endpoint": "${consts.endpoint}",
+						"headers": map[string]any{
+							"authorization": "${env.TOKEN}",
+						},
+					},
+				},
+				Dir: "${consts.step_dir}",
+				Env: []string{"STEP=${env.STEP}"},
+				Preconditions: []*ir.Condition{
+					{Condition: "${env.STEP_READY}"},
+					{Eval: "${params.step_eval}", Expected: "ready"},
+				},
+				RetryPolicy: ir.RetryPolicy{
+					LimitStr:       "${consts.retry_limit}",
+					IntervalSecStr: "${consts.retry_interval}",
+				},
+				RepeatPolicy: ir.RepeatPolicy{
+					LimitStr:       "${consts.repeat_limit}",
+					IntervalStr:    "${consts.repeat_interval}",
+					MaxIntervalStr: "${consts.repeat_max_interval}",
+					Condition:      &ir.Condition{Condition: "${env.REPEAT}"},
+				},
+				SubDAG: &ir.SubDAG{
+					Name:   "${consts.child_dag}",
+					Params: "${env.CHILD_PARAMS}",
+				},
+				Parallel: &ir.ParallelConfig{
+					Variable: "${params.items}",
+					Items: []ir.ParallelItem{
+						{
+							Value:  "${consts.item}",
+							Params: map[string]string{"target": "${env.TARGET}"},
+						},
+					},
+				},
+				Foreach: &ir.ForeachConfig{
+					Items: []any{
+						map[string]any{"source": "${params.foreach_source}"},
+					},
+					Key: "${foreach.item.source}",
+					Steps: []ir.Step{
+						{
+							Name:   "summarize",
+							Script: "echo ${foreach.item.source}",
+							Env:    []string{"ITEM=${foreach.item.source}"},
+						},
+					},
+					Collect: map[string]string{
+						"summary": "${steps.summarize.stdout}",
+					},
+				},
+				Stdout:         "${consts.stdout}",
+				StdoutArtifact: "${consts.stdout_artifact}",
+				Stderr:         "${consts.stderr}",
+				StderrArtifact: "${consts.stderr_artifact}",
+				StdoutOutputs: &ir.StepOutputsConfig{Fields: map[string]ir.StepOutputEntry{
+					"image": {
+						HasValue: true,
+						Value:    map[string]string{"tag": "${params.tag}"},
+						Path:     "${consts.output_path}",
+						Select:   "${consts.unsupported_select}",
+					},
+				}},
+				StructuredOutput: map[string]ir.StepOutputEntry{
+					"digest": {
+						HasValue: true,
+						Value:    []any{"${steps.build.outputs.image}"},
+						Path:     "${consts.digest_path}",
+						Select:   "${consts.unsupported_structured_select}",
+					},
+				},
+				Container: &ir.Container{
+					Image:      "${consts.step_image}",
+					WorkingDir: "${consts.step_container_dir}",
+				},
+				LLM: &ir.LLMConfig{
+					Provider:   "${consts.llm_provider}",
+					Model:      "${consts.llm_model}",
+					System:     "${env.LLM_SYSTEM}",
+					BaseURL:    "${env.LLM_BASE_URL}",
+					APIKeyName: "${env.LLM_API_KEY}",
+					Models: []ir.ModelEntry{
+						{
+							Provider:   "${consts.model_provider}",
+							Name:       "${consts.model_name}",
+							BaseURL:    "${env.MODEL_BASE_URL}",
+							APIKeyName: "${env.MODEL_API_KEY}",
+						},
+					},
+					Tools: []string{"${consts.llm_tool}"},
+				},
+				Messages: []ir.PromptMessage{
+					{Content: "${env.MESSAGE_CONTENT}"},
+				},
+			},
+		},
+		HandlerOn: ir.HandlerOn{
+			Init: &ir.Step{Name: "init", Script: "${consts.init_script}"},
+		},
+	}
+
+	fields := spec.ReferenceFields(dag)
+	got := make([]string, 0, len(fields))
+	for _, field := range fields {
+		got = append(got, field.Path)
+	}
+
+	assert.ElementsMatch(t, []string{
+		"env[0]",
+		"dotenv[0]",
+		"shell",
+		"shell_args[0]",
+		"working_dir",
+		"preconditions[0].condition",
+		"preconditions[1].eval",
+		"container.exec",
+		"container.image",
+		"container.name",
+		"container.user",
+		"container.working_dir",
+		"container.network",
+		"container.volumes[0]",
+		"container.ports[0]",
+		"container.env[0]",
+		"container.command[0]",
+		"container.shell[0]",
+		"ssh.user",
+		"ssh.host",
+		"ssh.port",
+		"ssh.key",
+		"ssh.password",
+		"ssh.known_host_file",
+		"ssh.shell",
+		"ssh.shell",
+		"ssh.bastion.host",
+		"ssh.bastion.port",
+		"ssh.bastion.user",
+		"ssh.bastion.key",
+		"ssh.bastion.password",
+		"steps[0].run",
+		"steps[0].run[0].command",
+		"steps[0].run[0].cmd_with_args",
+		"steps[0].run[0].args[0]",
+		"steps[0].with.endpoint",
+		"steps[0].with.headers.authorization",
+		"steps[0].working_dir",
+		"steps[0].env[0]",
+		"steps[0].preconditions[0].condition",
+		"steps[0].preconditions[1].eval",
+		"steps[0].retry_policy.limit",
+		"steps[0].retry_policy.interval_sec",
+		"steps[0].repeat_policy.limit",
+		"steps[0].repeat_policy.interval_sec",
+		"steps[0].repeat_policy.max_interval_sec",
+		"steps[0].repeat_policy.condition",
+		"steps[0].child_dag.name",
+		"steps[0].child_dag.params",
+		"steps[0].parallel.variable",
+		"steps[0].parallel.items[0].value",
+		"steps[0].parallel.items[0].params.target",
+		"steps[0].foreach.items[0].source",
+		"steps[0].foreach.key",
+		"steps[0].foreach.steps[0].run",
+		"steps[0].foreach.steps[0].env[0]",
+		"steps[0].foreach.collect.summary",
+		"steps[0].stdout",
+		"steps[0].stdout.artifact",
+		"steps[0].stderr",
+		"steps[0].stderr.artifact",
+		"steps[0].stdout.outputs.fields.image.value.tag",
+		"steps[0].output.digest.value[0]",
+		"steps[0].output.digest.path",
+		"steps[0].container.image",
+		"steps[0].container.working_dir",
+		"steps[0].llm.system",
+		"steps[0].llm.provider",
+		"steps[0].llm.model",
+		"steps[0].llm.base_url",
+		"steps[0].llm.model[0].provider",
+		"steps[0].llm.model[0].name",
+		"steps[0].llm.model[0].base_url",
+		"steps[0].messages[0].content",
+		"handler_on.init.run",
+	}, got)
+	assert.NotContains(t, got, "steps[0].stdout.outputs.fields.image.select")
+	assert.NotContains(t, got, "steps[0].stdout.outputs.fields.image.path")
+	assert.NotContains(t, got, "steps[0].output.digest.select")
+	assert.NotContains(t, got, "steps[0].llm.api_key_name")
+	assert.NotContains(t, got, "steps[0].llm.model[0].api_key_name")
+	assert.NotContains(t, got, "steps[0].llm.tools[0]")
+}
+
+func TestReferenceFieldsIncludesHumanTaskArtifacts(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{
+		Steps: []ir.Step{
+			{
+				Name: "review",
+				HumanTask: &ir.HumanTaskConfig{
+					Prompt:    "${consts.prompt}",
+					Artifacts: []string{"${consts.report}", "changes.diff"},
+				},
+			},
+		},
+	}
+
+	got := make([]string, 0)
+	for _, field := range spec.ReferenceFields(dag) {
+		got = append(got, field.Path)
+	}
+
+	assert.Contains(t, got, "steps[0].with.prompt")
+	assert.Contains(t, got, "steps[0].with.artifacts[0]")
+	assert.Contains(t, got, "steps[0].with.artifacts[1]")
+}
+
+// A nested path input reads a backslash as path text whether the map holding
+// it decoded from YAML or was built as a map[string]string.
+func TestReferenceFieldsReadNestedPathInputs(t *testing.T) {
+	t.Parallel()
+
+	const executorType = "reference_fields_nested_path"
+	registry.RegisterExecutorCapabilities(executorType, registry.ExecutorCapabilities{
+		PathInputs: []string{"import.input_file"},
+	})
+	t.Cleanup(func() { registry.UnregisterExecutorCapabilities(executorType) })
+
+	const raw = `in\${steps.read.outputs.rows}`
+	tests := []struct {
+		name     string
+		imported any
+	}{
+		{name: "AnyMap", imported: map[string]any{"input_file": raw, "table": raw}},
+		{name: "StringMap", imported: map[string]string{"input_file": raw, "table": raw}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dag := &ir.DAG{Steps: []ir.Step{{
+				Name: "load",
+				ExecutorConfig: ir.ExecutorConfig{
+					Type:   executorType,
+					Config: map[string]any{"import": tt.imported},
+				},
+			}}}
+
+			refs := make(map[string]int)
+			for _, field := range spec.ReferenceFields(dag) {
+				refs[field.Path] = len(field.Field.StepOutputReferences(field.Value))
+			}
+			assert.Equal(t, 1, refs["steps[0].with.import.input_file"])
+			assert.Equal(t, 0, refs["steps[0].with.import.table"])
+		})
+	}
+}
+
+// Only a numeric comparison resolves a reference in expected, so only that form
+// belongs in the reference set. Reporting a literal or regex pattern would
+// describe a resolution that never happens.
+func TestReferenceFieldsIncludesOnlyNumericExpected(t *testing.T) {
+	t.Parallel()
+
+	dag := &ir.DAG{
+		Steps: []ir.Step{
+			{
+				ID:   "gate",
+				Name: "gate",
+				Preconditions: []*ir.Condition{
+					{Condition: "0.9", Expected: "num:>=${params.threshold}"},
+					{Condition: "x", Expected: "${params.literal}"},
+					{Condition: "y", Expected: "re:${params.pattern}"},
+					{Condition: "0.5", ExpectedAny: []string{"num:<${params.low}", "${params.literal}"}},
+				},
+			},
+		},
+	}
+
+	paths := map[string]string{}
+	for _, field := range spec.ReferenceFields(dag) {
+		paths[field.Path] = field.Value
+	}
+
+	assert.Equal(t, "num:>=${params.threshold}", paths["steps[0].preconditions[0].expected"])
+	assert.NotContains(t, paths, "steps[0].preconditions[1].expected")
+	assert.NotContains(t, paths, "steps[0].preconditions[2].expected")
+	assert.Equal(t, "num:<${params.low}", paths["steps[0].preconditions[3].expected_any[0]"])
+	assert.NotContains(t, paths, "steps[0].preconditions[3].expected_any[1]")
+}

@@ -1,0 +1,961 @@
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { ToggleButton, ToggleGroup } from '@/components/ui/toggle-group';
+import { useResolvedTheme } from '@/contexts/UserPreference';
+import { cn, toMermaidNodeId } from '@/lib/utils';
+import {
+  ArrowDownUp,
+  ArrowRightLeft,
+  Expand,
+  FileDown,
+  GitGraph,
+  ImageDown,
+  Maximize2,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
+import React, { useState } from 'react';
+import { components, NodeStatus } from '../../../../api/v1/schema';
+import Mermaid from '@/components/ui/mermaid';
+import { exportGraphPng, exportGraphSvg } from './exportGraph';
+import {
+  GRAPH_CONTENT_PADDING_PX,
+  GRAPH_DEFAULT_HEIGHT,
+} from './graphViewport';
+import { useGraphViewport } from './useGraphViewport';
+import { I18nProps } from '@/i18n/I18nProps';
+import { I18nText } from '@/i18n/I18nText';
+import { useI18n } from '@/i18n/I18nProvider';
+
+/**
+ * Escapes special characters in labels for safe Mermaid syntax interpolation.
+ * Prevents parsing errors from quotes, backslashes, or newlines in step names/values.
+ */
+function escapeMermaidLabel(str: string): string {
+  return str
+    .replace(/\\/g, '\\\\') // Escape backslashes first
+    .replace(/"/g, '\\"') // Escape double quotes
+    .replace(/\n/g, '\\n') // Convert newlines to literal \n
+    .replace(/\r/g, ''); // Remove carriage returns
+}
+
+/** Callback type for node click events */
+type onClickNode = (name: string) => void;
+
+/** Callback type for node right-click events */
+type onRightClickNode = (name: string) => void;
+
+/** Flowchart direction type - TD (top-down) or LR (left-right) */
+export type FlowchartType = 'TD' | 'LR';
+
+/** Steps can be either configuration steps or runtime nodes */
+type Steps = components['schemas']['Step'][] | components['schemas']['Node'][];
+
+/** Props for the Graph component */
+type Props = {
+  /** Type of graph to render - status shows runtime state, config shows definition */
+  type: 'status' | 'config';
+  /** Direction of the flowchart - TD (top-down) or LR (left-right) */
+  flowchart?: FlowchartType;
+  /** Callback when flowchart direction changes */
+  onChangeFlowchart?: (value: FlowchartType) => void;
+  /** Steps or nodes to visualize */
+  steps?: Steps;
+  /** Callback for node click events */
+  onClickNode?: onClickNode;
+  /** Whether a single click should invoke onClickNode */
+  selectOnClick?: boolean;
+  /** Callback for node double-click events */
+  onDoubleClickNode?: onClickNode;
+  /** Callback for node right-click events */
+  onRightClickNode?: onRightClickNode;
+  /** Whether the graph is currently displayed in an expanded modal view */
+  isExpandedView?: boolean;
+  /**
+   * Graph box height: a number in pixels or any CSS height ('100%' fills a
+   * parent with a definite height). When omitted the box fits the graph,
+   * or fills its parent in the expanded view.
+   */
+  height?: string | number;
+  /** DAG name used for export filenames */
+  name?: string;
+  /** Content shown at the start of the toolbar, such as an interactions hint. */
+  toolbarStart?: React.ReactNode;
+  /** Step drawn as selected, such as the one whose details are open. */
+  selectedStepName?: string;
+};
+
+const GRAPH_STATUS_STROKES = {
+  none: '#8a8d99',
+  running: '#7c6ef4',
+  retrying: '#d9a03c',
+  done: '#22c55e',
+  error: '#ef5350',
+  cancel: '#c084fc',
+  skipped: '#8a8d99',
+  partial: '#d9a03c',
+  waiting: '#d9a03c',
+  rejected: '#ef5350',
+} as const;
+
+// Statuses that keep the plain card fill instead of a tint.
+const GRAPH_UNTINTED_CLASSES = new Set(['none', 'skipped']);
+const GRAPH_STATUS_TINT = 0.1;
+const GRAPH_NODE_STROKE_WIDTH = '2px';
+const GRAPH_NODE_CORNER_RADIUS = '6';
+
+const GRAPH_SUCCESS_LINK_STROKE = '#3fa76b';
+const GRAPH_RENDERED_NODE_SHAPE_SELECTOR =
+  'rect, polygon, path, circle, ellipse';
+
+/** Blends two `#rrggbb` colors, taking `amount` of `color` over `base`. */
+function mixHexColors(color: string, base: string, amount: number): string {
+  const channel = (hex: string, index: number) =>
+    parseInt(hex.slice(1 + index * 2, 3 + index * 2), 16);
+  const mixed = [0, 1, 2].map((index) =>
+    Math.round(
+      channel(color, index) * amount + channel(base, index) * (1 - amount)
+    )
+      .toString(16)
+      .padStart(2, '0')
+  );
+  return `#${mixed.join('')}`;
+}
+
+/** Ring drawn around the selected node; SVG has no outline. */
+const GRAPH_SELECTED_FILTER =
+  'drop-shadow(0 0 1.5px var(--ring)) drop-shadow(0 0 4px var(--ring))';
+
+/**
+ * Marks the rendered node of nodeId as selected and clears the others.
+ * Mermaid wraps the id in its own element id; node ids contain only id
+ * characters, so any other character delimits them.
+ */
+function markSelectedNode(container: HTMLElement, nodeId?: string): void {
+  const pattern = nodeId
+    ? new RegExp(`(^|[^A-Za-z0-9_])${nodeId}($|[^A-Za-z0-9_])`)
+    : null;
+  container.querySelectorAll<SVGGElement>('g.node').forEach((nodeElement) => {
+    const selected = !!pattern && pattern.test(nodeElement.id);
+    nodeElement.style.filter = selected ? GRAPH_SELECTED_FILTER : '';
+    if (selected) {
+      nodeElement.setAttribute('data-selected', 'true');
+    } else {
+      nodeElement.removeAttribute('data-selected');
+    }
+  });
+}
+
+function applyRenderedGraphStyles(container: HTMLDivElement): void {
+  Object.entries(GRAPH_STATUS_STROKES).forEach(([className, stroke]) => {
+    container
+      .querySelectorAll<SVGGElement>(`g.node.${className}`)
+      .forEach((nodeElement) => {
+        nodeElement
+          .querySelectorAll<SVGElement>(GRAPH_RENDERED_NODE_SHAPE_SELECTOR)
+          .forEach((shapeElement) => {
+            shapeElement.setAttribute('stroke', stroke);
+            shapeElement.setAttribute('stroke-width', GRAPH_NODE_STROKE_WIDTH);
+            shapeElement.style.setProperty('stroke', stroke, 'important');
+            shapeElement.style.setProperty(
+              'stroke-width',
+              GRAPH_NODE_STROKE_WIDTH,
+              'important'
+            );
+            if (shapeElement.tagName.toLowerCase() === 'rect') {
+              shapeElement.setAttribute('rx', GRAPH_NODE_CORNER_RADIUS);
+              shapeElement.setAttribute('ry', GRAPH_NODE_CORNER_RADIUS);
+            }
+          });
+      });
+  });
+}
+
+/** Extend window interface to include the click handler (kept for backward compatibility) */
+declare global {
+  interface Window {
+    onClickMermaidNode: onClickNode;
+  }
+}
+
+/**
+ * Graph component for visualizing DAG dagRuns
+ * Renders a Mermaid.js flowchart with nodes and connections
+ */
+function Graph({
+  steps,
+  flowchart = 'TD',
+  onChangeFlowchart,
+  type = 'status',
+  onClickNode,
+  selectOnClick = false,
+  onDoubleClickNode,
+  onRightClickNode,
+  isExpandedView = false,
+  height,
+  name,
+  toolbarStart,
+  selectedStepName,
+}: Props): React.JSX.Element {
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const viewportRef = React.useRef<HTMLDivElement>(null);
+  const isDarkMode = useResolvedTheme() === 'dark';
+  const selectedNodeId = selectedStepName
+    ? toMermaidNodeId(selectedStepName)
+    : undefined;
+  const selectedNodeIdRef = React.useRef(selectedNodeId);
+  selectedNodeIdRef.current = selectedNodeId;
+  const applyGraphStyles = React.useCallback((container: HTMLDivElement) => {
+    applyRenderedGraphStyles(container);
+    markSelectedNode(container, selectedNodeIdRef.current);
+  }, []);
+  React.useEffect(() => {
+    if (containerRef.current) {
+      markSelectedNode(containerRef.current, selectedNodeId);
+    }
+  }, [selectedNodeId]);
+  const graphControlButtonClass = 'h-7 w-7 shrink-0 px-0 font-medium';
+  const selectedLayoutClass =
+    'bg-muted text-foreground shadow-none dark:border-0 dark:bg-muted dark:text-foreground';
+
+  const handleExport = (format: 'png' | 'svg') => {
+    // Scope to the mermaid wrapper; the control bar renders its own icon SVGs.
+    const svg =
+      containerRef.current?.querySelector<SVGSVGElement>('.mermaid svg');
+    if (!svg) {
+      return;
+    }
+    const baseName = name || 'dag';
+    if (format === 'svg') {
+      exportGraphSvg(svg, baseName);
+    } else {
+      exportGraphPng(svg, baseName);
+    }
+  };
+
+  const mermaidStyle: React.CSSProperties = React.useMemo(() => {
+    const gridBackground = isDarkMode
+      ? 'radial-gradient(circle, rgba(255,255,255,0.09) 1px, transparent 1.2px)'
+      : 'radial-gradient(circle, rgba(17,17,20,0.14) 1px, transparent 1.2px)';
+
+    return {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: GRAPH_CONTENT_PADDING_PX,
+      cursor: 'grab',
+      userSelect: 'none',
+      background: gridBackground,
+      backgroundSize: '16px 16px',
+    };
+  }, [isDarkMode]);
+
+  const mermaidNodeIds = React.useMemo(() => {
+    return (steps ?? []).map((stepOrNode) => {
+      const step = isRuntimeNode(stepOrNode) ? stepOrNode.step : stepOrNode;
+      return toMermaidNodeId(step.name);
+    });
+  }, [steps]);
+
+  // Nodes and dependency edges decide the layout; status updates do not.
+  const structureKey = React.useMemo(
+    () =>
+      JSON.stringify([
+        flowchart,
+        (steps ?? []).map((stepOrNode) => {
+          const step = isRuntimeNode(stepOrNode) ? stepOrNode.step : stepOrNode;
+          return [step.name, allDepends(step)];
+        }),
+      ]),
+    [flowchart, steps]
+  );
+  const sizeToContent = height === undefined && !isExpandedView;
+  const {
+    scale,
+    autoHeight,
+    handleContentSize,
+    zoomIn,
+    zoomOut,
+    resetZoom,
+    fitToView,
+  } = useGraphViewport({
+    boxRef: containerRef,
+    viewportRef,
+    layout: flowchart,
+    structureKey,
+    initialFit: isExpandedView ? 'full' : 'readable',
+    sizeToContent,
+  });
+
+  const graph = React.useMemo(() => {
+    if (!steps || steps.length === 0) return '';
+
+    const dat: string[] = [];
+    dat.push(`flowchart ${flowchart};`);
+
+    // Add legend comment
+    dat.push(
+      `%% Shapes: Rectangle=Normal Step, Subprocess=Single Sub DAG, Processes=Parallel Execution`
+    );
+
+    // Store the click handler in window for backward compatibility
+    // but we'll use double-click for navigation
+    if (onClickNode) {
+      window.onClickMermaidNode = onClickNode;
+    }
+
+    // Track link style indices for individual arrow styling
+    let linkIndex = 0;
+    const linkStyles: string[] = [];
+    // Track node classes for separate application
+    const nodeClasses = new Map<string, string>();
+
+    function addNodeFn(
+      step: components['schemas']['Step'],
+      status: NodeStatus,
+      node?: components['schemas']['Node']
+    ): void {
+      const id = toMermaidNodeId(step.name);
+      const c = graphStatusMap[status] || '';
+
+      const subRuns = [
+        ...(node?.subRuns ?? []),
+        ...(node?.subRunsRepeated ?? []),
+      ];
+      const subDAGName = step.call || subRuns[0]?.dagName;
+      // Check if this is a sub dagRun node (has a 'run' property)
+      const isSubDAGRun = !!subDAGName;
+      const hasParallelExecutions = !!step.parallel;
+      // Check if this is a router step
+      const isRouterStep =
+        step.executorConfig?.type === 'router' || !!step.router;
+
+      // Add indicator for sub dagRun nodes in the label only
+      // Escape any special characters in the label to prevent Mermaid parsing errors
+      let label = step.name;
+      if (isSubDAGRun && subDAGName) {
+        if (hasParallelExecutions && subRuns.length > 0) {
+          // Show parallel execution count in the label - avoid brackets in stadium nodes
+          label = `${step.name} -> ${subDAGName} x${subRuns.length}`;
+        } else {
+          // Single sub DAG run
+          label = `${step.name} -> ${subDAGName}`;
+        }
+      }
+
+      // Use different shapes based on node type
+      if (isRouterStep) {
+        // Diamond shape for router/decision nodes
+        // Escape labels to prevent Mermaid parsing errors from special characters
+        const routerLabel = step.router?.value
+          ? `${escapeMermaidLabel(step.name)}\\n${escapeMermaidLabel(step.router.value)}`
+          : escapeMermaidLabel(step.name);
+        dat.push(`${id}@{ shape: diamond, label: "${routerLabel}"};`);
+        if (c) {
+          nodeClasses.set(id, c.replace(':::', ''));
+        }
+      } else if (isSubDAGRun) {
+        // Escape label to prevent Mermaid parsing errors
+        const escapedLabel = escapeMermaidLabel(label);
+        if (hasParallelExecutions) {
+          // Multiple parallel executions - use procs icon
+          dat.push(`${id}@{ shape: procs, label: "${escapedLabel}"};`);
+        } else {
+          // Single sub DAG - use subproc icon
+          dat.push(`${id}@{ shape: subproc, label: "${escapedLabel}"};`);
+        }
+        // Store class for later application (remove ::: prefix)
+        if (c) {
+          nodeClasses.set(id, c.replace(':::', ''));
+        }
+      } else {
+        // Normal step - use rectangle with inline class syntax
+        // Escape label to prevent Mermaid parsing errors
+        dat.push(`${id}["${escapeMermaidLabel(label)}"]${c};`);
+      }
+
+      // Process dependencies and add connections
+      if (step.depends) {
+        step.depends.forEach((dep) => {
+          const depId = toMermaidNodeId(dep);
+          if (status === NodeStatus.Failed) {
+            // Dashed line for error state
+            dat.push(`${depId} -.- ${id};`);
+            linkStyles.push(
+              `linkStyle ${linkIndex} stroke:#ef5350,stroke-width:1.8px,stroke-dasharray:3`
+            );
+          } else if (status === NodeStatus.Success) {
+            // Solid line with success color
+            dat.push(`${depId} --> ${id};`);
+            linkStyles.push(
+              `linkStyle ${linkIndex} stroke:${GRAPH_SUCCESS_LINK_STROKE},stroke-width:1.8px`
+            );
+          } else {
+            // Default connection style
+            dat.push(`${depId} --> ${id};`);
+            linkStyles.push(
+              `linkStyle ${linkIndex} stroke:#62656f,stroke-width:1px`
+            );
+          }
+          linkIndex++;
+        });
+      }
+
+      // Inferred dependencies come from step-output references rather than
+      // depends, so they are drawn dashed to stay distinguishable.
+      step.inferredDepends?.forEach((dep) => {
+        const depId = toMermaidNodeId(dep);
+        dat.push(`${depId} -.-> ${id};`);
+        linkStyles.push(
+          `linkStyle ${linkIndex} ${inferredLinkStyle(status)},stroke-dasharray:${INFERRED_LINK_DASH}`
+        );
+        linkIndex++;
+      });
+
+      // We no longer add the standard Mermaid click handler
+      // Double-click will be handled by our custom implementation
+    }
+
+    // Process nodes based on type
+    if (type === 'status') {
+      (steps as components['schemas']['Node'][]).forEach((node) =>
+        addNodeFn(node.step, node.status, node)
+      );
+    } else {
+      (steps as components['schemas']['Step'][]).forEach((step) =>
+        addNodeFn(step, 0)
+      );
+    }
+
+    // Define node styles for different states
+    // Use theme-appropriate colors for light/dark modes
+    const nodeFill = isDarkMode ? '#141417' : '#ffffff'; // --card per mode
+    const nodeColor = isDarkMode ? '#ededf0' : '#111114'; // --foreground per mode
+
+    // Status shows in the border and a light tint of the same color, so a
+    // node stays readable in both themes.
+    Object.entries(GRAPH_STATUS_STROKES).forEach(([className, stroke]) => {
+      const fill = GRAPH_UNTINTED_CLASSES.has(className)
+        ? nodeFill
+        : mixHexColors(stroke, nodeFill, GRAPH_STATUS_TINT);
+      dat.push(
+        `classDef ${className} color:${nodeColor},fill:${fill},stroke:${stroke},stroke-width:${GRAPH_NODE_STROKE_WIDTH}`
+      );
+    });
+
+    // Add custom link styles
+    dat.push(...linkStyles);
+
+    // Apply classes to nodes that use the new shape syntax (procs/subproc)
+    nodeClasses.forEach((className, nodeId) => {
+      dat.push(`class ${nodeId} ${className};`);
+    });
+
+    return dat.join('\n');
+  }, [steps, type, onClickNode, flowchart, isDarkMode]);
+
+  return (
+    <div
+      className="relative flex min-h-0 flex-col"
+      style={{
+        height:
+          height ??
+          (isExpandedView ? '100%' : (autoHeight ?? GRAPH_DEFAULT_HEIGHT)),
+      }}
+      ref={containerRef}
+    >
+      <div className="@container flex shrink-0 items-center gap-2 border-b border-border px-2 py-1">
+        {toolbarStart}
+        <I18nProps>
+          <ToggleGroup
+            aria-label="Graph controls"
+            className="ml-auto min-w-0 gap-0.5 overflow-x-auto rounded-none border-0 bg-transparent p-0"
+          >
+            {onChangeFlowchart && (
+              <>
+                <I18nProps>
+                  <ToggleButton
+                    value="LR"
+                    groupValue={flowchart}
+                    onClick={() => onChangeFlowchart('LR')}
+                    aria-label="Horizontal layout"
+                    title="Horizontal layout"
+                    position="first"
+                    className={cn(
+                      graphControlButtonClass,
+                      flowchart === 'LR' && selectedLayoutClass
+                    )}
+                  >
+                    <ArrowRightLeft className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+                <I18nProps>
+                  <ToggleButton
+                    value="TD"
+                    groupValue={flowchart}
+                    onClick={() => onChangeFlowchart('TD')}
+                    aria-label="Vertical layout"
+                    title="Vertical layout"
+                    position="middle"
+                    className={cn(
+                      graphControlButtonClass,
+                      flowchart === 'TD' && selectedLayoutClass
+                    )}
+                  >
+                    <ArrowDownUp className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+                <div className="mx-1 h-4 w-px shrink-0 self-center bg-border" />
+              </>
+            )}
+
+            <I18nProps>
+              <ToggleButton
+                value="zoomin"
+                onClick={() => zoomIn()}
+                aria-label="Zoom in"
+                title="Zoom in"
+                position={onChangeFlowchart ? 'middle' : 'first'}
+                className={graphControlButtonClass}
+              >
+                <ZoomIn className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="zoomout"
+                onClick={() => zoomOut()}
+                aria-label="Zoom out"
+                title="Zoom out"
+                position="middle"
+                className={graphControlButtonClass}
+              >
+                <ZoomOut className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="fit"
+                onClick={() => fitToView()}
+                aria-label="Fit to screen"
+                title="Fit to screen"
+                position="middle"
+                className={graphControlButtonClass}
+              >
+                <Maximize2 className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="reset"
+                onClick={() => resetZoom()}
+                aria-label="Reset zoom"
+                title="Reset zoom"
+                position="middle"
+                className={cn(graphControlButtonClass, 'w-auto px-1.5')}
+              >
+                <span className="tabular-nums">{Math.round(scale * 100)}%</span>
+              </ToggleButton>
+            </I18nProps>
+
+            <div className="mx-1 h-4 w-px shrink-0 self-center bg-border" />
+            <I18nProps>
+              <ToggleButton
+                value="export-png"
+                onClick={() => handleExport('png')}
+                aria-label="Export as PNG"
+                title="Export as PNG"
+                position="middle"
+                className={graphControlButtonClass}
+              >
+                <ImageDown className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+            <I18nProps>
+              <ToggleButton
+                value="export-svg"
+                onClick={() => handleExport('svg')}
+                aria-label="Export as SVG"
+                title="Export as SVG"
+                position={isExpandedView ? 'last' : 'middle'}
+                className={graphControlButtonClass}
+              >
+                <FileDown className="h-4 w-4" />
+              </ToggleButton>
+            </I18nProps>
+
+            {!isExpandedView && (
+              <>
+                <div className="mx-1 h-4 w-px shrink-0 self-center bg-border" />
+                <I18nProps>
+                  <ToggleButton
+                    value="expand"
+                    onClick={() => setIsModalOpen(true)}
+                    aria-label="Expand graph"
+                    title="Expand graph"
+                    position="last"
+                    className={graphControlButtonClass}
+                  >
+                    <Expand className="h-4 w-4" />
+                  </ToggleButton>
+                </I18nProps>
+              </>
+            )}
+          </ToggleGroup>
+        </I18nProps>
+      </div>
+
+      <div
+        className={cn(
+          'custom-scrollbar min-h-0 flex-1 overflow-hidden',
+          isExpandedView ? 'rounded-lg border border-border/30 bg-muted/5' : ''
+        )}
+      >
+        <Mermaid
+          style={mermaidStyle}
+          def={graph}
+          scale={scale}
+          viewportRef={viewportRef}
+          onContentSize={handleContentSize}
+          nodeIds={mermaidNodeIds}
+          onClick={selectOnClick ? onClickNode : undefined}
+          onDoubleClick={onDoubleClickNode ?? onClickNode}
+          onRightClick={onRightClickNode}
+          onRender={applyGraphStyles}
+          fallback={
+            <GraphFallback
+              steps={steps}
+              selectOnClick={selectOnClick}
+              onClickNode={onClickNode}
+              onDoubleClickNode={onDoubleClickNode ?? onClickNode}
+              onRightClickNode={onRightClickNode}
+            />
+          }
+        />
+      </div>
+
+      {!isExpandedView && (
+        <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
+          <DialogContent className="max-w-[95vw] w-full max-h-[90vh] h-full flex flex-col p-6 overflow-hidden">
+            <DialogHeader className="flex-shrink-0 mb-2">
+              <DialogTitle className="flex items-center gap-2 text-xl font-semibold">
+                <GitGraph className="h-5 w-5 text-primary" />
+                <I18nText text={'Visual Graph'} />
+              </DialogTitle>
+            </DialogHeader>
+            <div className="flex-1 min-h-0 bg-surface rounded-xl p-1 shadow-inner border border-border/20">
+              <Graph
+                steps={steps}
+                flowchart={flowchart}
+                onChangeFlowchart={onChangeFlowchart}
+                type={type}
+                onClickNode={onClickNode}
+                selectOnClick={selectOnClick}
+                onDoubleClickNode={onDoubleClickNode}
+                onRightClickNode={onRightClickNode}
+                name={name}
+                isExpandedView={true}
+              />
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
+  );
+}
+
+function isRuntimeNode(
+  stepOrNode: components['schemas']['Step'] | components['schemas']['Node']
+): stepOrNode is components['schemas']['Node'] {
+  return 'step' in stepOrNode;
+}
+
+function getStepLabel(
+  step: components['schemas']['Step'],
+  node?: components['schemas']['Node']
+): string {
+  const subRuns = [...(node?.subRuns ?? []), ...(node?.subRunsRepeated ?? [])];
+  const subDAGName = step.call || subRuns[0]?.dagName;
+  const hasParallelExecutions = !!step.parallel;
+
+  if (!subDAGName) {
+    return step.name;
+  }
+  if (hasParallelExecutions && subRuns.length > 0) {
+    return `${step.name} -> ${subDAGName} x${subRuns.length}`;
+  }
+  return `${step.name} -> ${subDAGName}`;
+}
+
+const INFERRED_LINK_DASH = '6 3';
+
+function inferredLinkStyle(status: NodeStatus): string {
+  if (status === NodeStatus.Failed) {
+    return 'stroke:#ef5350,stroke-width:1.8px';
+  }
+  if (status === NodeStatus.Success) {
+    return `stroke:${GRAPH_SUCCESS_LINK_STROKE},stroke-width:1.8px`;
+  }
+  return 'stroke:#62656f,stroke-width:1px';
+}
+
+function allDepends(step: {
+  depends?: string[];
+  inferredDepends?: string[];
+}): string[] {
+  return [...(step.depends ?? []), ...(step.inferredDepends ?? [])];
+}
+
+type FallbackNode = {
+  id: string;
+  name: string;
+  label: string;
+  depends: string[];
+  status: NodeStatus;
+};
+
+type GraphFallbackProps = {
+  steps?: Steps;
+  selectOnClick: boolean;
+  onClickNode?: onClickNode;
+  onDoubleClickNode?: onClickNode;
+  onRightClickNode?: onRightClickNode;
+};
+
+function GraphFallback({
+  steps,
+  selectOnClick,
+  onClickNode,
+  onDoubleClickNode,
+  onRightClickNode,
+}: GraphFallbackProps): React.JSX.Element | null {
+  const { ts } = useI18n();
+  const clickTimeoutsRef = React.useRef<
+    Map<string, ReturnType<typeof setTimeout>>
+  >(new Map());
+
+  React.useEffect(() => {
+    return () => {
+      clickTimeoutsRef.current.forEach((timeout) => clearTimeout(timeout));
+      clickTimeoutsRef.current.clear();
+    };
+  }, []);
+
+  const nodes = React.useMemo<FallbackNode[]>(() => {
+    return (steps ?? []).map((stepOrNode) => {
+      const node = isRuntimeNode(stepOrNode) ? stepOrNode : undefined;
+      const step = isRuntimeNode(stepOrNode) ? stepOrNode.step : stepOrNode;
+      return {
+        id: toMermaidNodeId(step.name),
+        name: step.name,
+        label: getStepLabel(step, node),
+        depends: allDepends(step),
+        status: node?.status ?? NodeStatus.NotStarted,
+      };
+    });
+  }, [steps]);
+
+  const handleClick = React.useCallback(
+    (id: string) => {
+      if (!selectOnClick || !onClickNode) {
+        return;
+      }
+      const existingTimeout = clickTimeoutsRef.current.get(id);
+      if (existingTimeout) {
+        clearTimeout(existingTimeout);
+      }
+      const timeout = setTimeout(() => {
+        clickTimeoutsRef.current.delete(id);
+        onClickNode(id);
+      }, 250);
+      clickTimeoutsRef.current.set(id, timeout);
+    },
+    [onClickNode, selectOnClick]
+  );
+
+  const handleDoubleClick = React.useCallback(
+    (id: string) => {
+      const existingTimeout = clickTimeoutsRef.current.get(id);
+      if (existingTimeout) {
+        clearTimeout(existingTimeout);
+        clickTimeoutsRef.current.delete(id);
+      }
+      onDoubleClickNode?.(id);
+    },
+    [onDoubleClickNode]
+  );
+
+  const handleRightClick = React.useCallback(
+    (event: React.MouseEvent, id: string) => {
+      if (!onRightClickNode) {
+        return;
+      }
+      event.preventDefault();
+      const existingTimeout = clickTimeoutsRef.current.get(id);
+      if (existingTimeout) {
+        clearTimeout(existingTimeout);
+        clickTimeoutsRef.current.delete(id);
+      }
+      onRightClickNode(id);
+    },
+    [onRightClickNode]
+  );
+
+  if (nodes.length === 0) {
+    return null;
+  }
+
+  const hasInteraction =
+    (selectOnClick && !!onClickNode) ||
+    !!onDoubleClickNode ||
+    !!onRightClickNode;
+
+  return (
+    <I18nProps>
+      <div
+        aria-label="Workflow graph"
+        className="min-w-full p-6 pr-24"
+        data-testid="graph-fallback"
+        role="list"
+      >
+        <div className="flex flex-wrap items-start gap-3">
+          {nodes.map((node) => (
+            <div key={node.id} role="listitem">
+              {hasInteraction ? (
+                <button
+                  aria-label={ts('Inspect {name}', { name: node.name })}
+                  className={fallbackNodeClassName(node.status, true)}
+                  onClick={() => handleClick(node.id)}
+                  onContextMenu={(event) => handleRightClick(event, node.id)}
+                  onDoubleClick={() => handleDoubleClick(node.id)}
+                  title={node.name}
+                  type="button"
+                >
+                  <FallbackNodeContent node={node} />
+                </button>
+              ) : (
+                <div
+                  className={fallbackNodeClassName(node.status, false)}
+                  title={node.name}
+                >
+                  <FallbackNodeContent node={node} />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </I18nProps>
+  );
+}
+
+function FallbackNodeContent({ node }: { node: FallbackNode }) {
+  const visibleDepends = node.depends.slice(0, 2);
+  const hiddenDepends = node.depends.length - visibleDepends.length;
+
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className={cn(
+          'h-2.5 w-2.5 flex-shrink-0 rounded-full',
+          fallbackStatusDotClassName(node.status)
+        )}
+      />
+      <span className="min-w-0 flex-1 whitespace-normal break-words font-medium">
+        {node.label}
+      </span>
+      {visibleDepends.length > 0 && (
+        <span className="flex min-w-0 max-w-full flex-wrap gap-1">
+          {visibleDepends.map((dep) => (
+            <span
+              className="max-w-28 whitespace-normal break-words rounded border border-border bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+              key={dep}
+              title={dep}
+            >
+              {dep}
+            </span>
+          ))}
+          {hiddenDepends > 0 && (
+            <span className="whitespace-normal break-words rounded border border-border bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              +{hiddenDepends}
+            </span>
+          )}
+        </span>
+      )}
+    </>
+  );
+}
+
+function fallbackNodeClassName(
+  status: NodeStatus,
+  interactive: boolean
+): string {
+  return cn(
+    'flex min-h-12 w-72 max-w-72 items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-sm shadow-sm',
+    fallbackStatusBorderClassName(status),
+    interactive &&
+      'cursor-pointer transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary'
+  );
+}
+
+function fallbackStatusBorderClassName(status: NodeStatus): string {
+  switch (status) {
+    case NodeStatus.Success:
+      return 'border-l-4 border-l-success';
+    case NodeStatus.Running:
+      return 'border-l-4 border-l-[var(--status-running)]';
+    case NodeStatus.Retrying:
+    case NodeStatus.Waiting:
+    case NodeStatus.PartialSuccess:
+      return 'border-l-4 border-l-warning';
+    case NodeStatus.Failed:
+    case NodeStatus.Rejected:
+      return 'border-l-4 border-l-destructive';
+    case NodeStatus.Aborted:
+      return 'border-l-4 border-l-primary';
+    default:
+      return 'border-l-4 border-l-muted-foreground/60';
+  }
+}
+
+function fallbackStatusDotClassName(status: NodeStatus): string {
+  switch (status) {
+    case NodeStatus.Success:
+      return 'bg-success';
+    case NodeStatus.Running:
+      return 'bg-[var(--status-running)] animate-pulse';
+    case NodeStatus.Retrying:
+    case NodeStatus.Waiting:
+    case NodeStatus.PartialSuccess:
+      return 'bg-warning';
+    case NodeStatus.Failed:
+    case NodeStatus.Rejected:
+      return 'bg-destructive';
+    case NodeStatus.Aborted:
+      return 'bg-primary';
+    default:
+      return 'bg-muted-foreground/60';
+  }
+}
+
+export default Graph;
+
+// Map node status to CSS classes for styling
+const graphStatusMap: Record<NodeStatus, string> = {
+  [NodeStatus.NotStarted]: ':::none',
+  [NodeStatus.Running]: ':::running',
+  [NodeStatus.Retrying]: ':::retrying',
+  [NodeStatus.Failed]: ':::error',
+  [NodeStatus.Aborted]: ':::cancel',
+  [NodeStatus.Success]: ':::done',
+  [NodeStatus.Skipped]: ':::skipped',
+  [NodeStatus.PartialSuccess]: ':::partial',
+  [NodeStatus.Waiting]: ':::waiting',
+  [NodeStatus.Rejected]: ':::rejected',
+};

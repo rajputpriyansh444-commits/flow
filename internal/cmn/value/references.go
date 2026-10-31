@@ -1,0 +1,332 @@
+package value
+
+import (
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"unicode"
+)
+
+// referenceKind classifies a placeholder found in a value string.
+type referenceKind string
+
+const (
+	referenceStrict  referenceKind = "strict"
+	referenceEval    referenceKind = "eval"
+	referenceInvalid referenceKind = "invalid"
+)
+
+type reference struct {
+	Raw        string
+	Expr       string
+	Namespace  string
+	Segments   []string
+	Kind       referenceKind
+	Braced     bool
+	Start      int
+	End        int
+	Err        error
+	StepOutput *StepOutputReference
+}
+
+// StepOutputReference describes a step output reference in eval syntax.
+type StepOutputReference struct {
+	Expression string
+	StepName   string
+	Path       []string
+}
+
+// scanReferences classifies strict references and eval refs. When escapes is
+// set, a reference whose dollar carries a backslash escape is skipped.
+func scanReferences(raw string, escapes bool) []reference {
+	if raw == "" {
+		return nil
+	}
+
+	refs := make([]reference, 0)
+	for _, loc := range bindingRefPattern.FindAllStringSubmatchIndex(raw, -1) {
+		if escapes && isEscapedDollar(raw, loc[0]) {
+			continue
+		}
+		expr := strings.TrimSpace(raw[loc[2]:loc[3]])
+		refs = append(refs, classifyBracedReference(raw[loc[0]:loc[1]], expr, loc[0], loc[1]))
+	}
+	for _, loc := range referencePattern.FindAllStringSubmatchIndex(raw, -1) {
+		if escapes && isEscapedDollar(raw, loc[0]) {
+			continue
+		}
+		if loc[0]+1 < len(raw) && raw[loc[0]+1] == '{' {
+			continue
+		}
+		rawRef := raw[loc[0]:loc[1]]
+		namespace := raw[loc[6]:loc[7]]
+		expr := namespace + raw[loc[8]:loc[9]]
+		ref := reference{
+			Raw:       rawRef,
+			Expr:      expr,
+			Namespace: namespace,
+			Segments:  strings.Split(expr, "."),
+			Kind:      referenceEval,
+			Start:     loc[0],
+			End:       loc[1],
+		}
+		refs = append(refs, ref)
+	}
+
+	sort.SliceStable(refs, func(i, j int) bool {
+		return refs[i].Start < refs[j].Start
+	})
+	return refs
+}
+
+// HasValueReference reports whether raw contains a supported value-reference form.
+func HasValueReference(raw string) bool {
+	return Field{}.HasValueReference(raw)
+}
+
+// HasValueReference reports whether raw, read as a value of the field,
+// contains a supported value-reference form.
+func (f Field) HasValueReference(raw string) bool {
+	for _, ref := range scanReferences(raw, f.escapesDollar()) {
+		if ref.Kind == referenceStrict || ref.Kind == referenceEval {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAnyReference reports whether raw contains an unescaped ${...}, $NAME, or
+// $N reference anywhere in the text, in any form value resolution may expand.
+func HasAnyReference(raw string) bool {
+	for _, loc := range reVarSubstitution.FindAllStringIndex(raw, -1) {
+		if !isEscapedDollar(raw, loc[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasReferenceToNamespace reports whether raw references one of the named scopes.
+func HasReferenceToNamespace(raw string, namespaces ...string) bool {
+	for _, ref := range scanReferences(raw, true) {
+		if ref.Kind != referenceStrict && ref.Kind != referenceEval {
+			continue
+		}
+		if slices.Contains(namespaces, ref.Namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+// plainReferenceName matches an unqualified environment name.
+var plainReferenceName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// IsWholeReference reports whether text is exactly one value reference and
+// nothing else.
+//
+// It accepts the canonical scoped forms IsExactRef accepts, and the unqualified
+// environment forms ${NAME} and $NAME, which resolve wherever a field expands
+// environment values.
+func IsWholeReference(text string) bool {
+	if IsExactRef(text) {
+		return true
+	}
+	if inner, ok := strings.CutPrefix(text, "${"); ok {
+		name, closed := strings.CutSuffix(inner, "}")
+		return closed && plainReferenceName.MatchString(name)
+	}
+	if name, ok := strings.CutPrefix(text, "$"); ok {
+		return plainReferenceName.MatchString(name)
+	}
+	return false
+}
+
+// IsExactRef reports whether token is an exact canonical scoped reference.
+func IsExactRef(token string) bool {
+	_, ok := parseExactRef(token)
+	return ok
+}
+
+func parseExactRef(token string) (reference, bool) {
+	refs := scanReferences(token, true)
+	if len(refs) != 1 {
+		return reference{}, false
+	}
+	ref := refs[0]
+	if ref.Kind != referenceStrict || !ref.Braced || ref.Start != 0 || ref.End != len(token) {
+		return reference{}, false
+	}
+	if ref.Raw != "${"+ref.Expr+"}" {
+		return reference{}, false
+	}
+
+	switch ref.Namespace {
+	case "consts", "env", "steps", "foreach", "inputs", "outputs", "context":
+		return ref, true
+	case "params":
+		// The aggregate ${params} form is JSON data, not a named value reference.
+		return ref, len(ref.Segments) == 2
+	default:
+		return reference{}, false
+	}
+}
+
+func classifyBracedReference(rawRef, expr string, start, end int) reference {
+	segments := strings.Split(expr, ".")
+	ref := reference{
+		Raw:       rawRef,
+		Expr:      expr,
+		Namespace: segments[0],
+		Segments:  segments,
+		Braced:    true,
+		Start:     start,
+		End:       end,
+	}
+	if supportedStrictBinding(segments) {
+		ref.Kind = referenceStrict
+		if stepOutput, ok := parseStepOutputReference(ref); ok {
+			ref.StepOutput = &stepOutput
+		}
+		return ref
+	}
+	if strings.Contains(expr, ".") {
+		ref.Kind = referenceEval
+	}
+	return ref
+}
+
+func parseStepOutputReference(ref reference) (StepOutputReference, bool) {
+	if !ref.Braced {
+		return StepOutputReference{}, false
+	}
+
+	if len(ref.Segments) != 4 || ref.Segments[0] != "steps" || ref.Segments[2] != "outputs" {
+		return StepOutputReference{}, false
+	}
+
+	stepName := ref.Segments[1]
+	if !validStepOutputStepName(stepName) {
+		return StepOutputReference{}, false
+	}
+	outputName := ref.Segments[3]
+	if !validOutputPathSegment(outputName) {
+		return StepOutputReference{}, false
+	}
+	return StepOutputReference{
+		Expression: ref.Raw,
+		StepName:   stepName,
+		Path:       []string{outputName},
+	}, true
+}
+
+// IsStepOutputReferenceToken reports whether token is an exact Spec 007 reference.
+func IsStepOutputReferenceToken(token string) bool {
+	_, ok := ParseStepOutputReferenceToken(token)
+	return ok
+}
+
+// HasStepRuntimeOutputReference reports whether raw reads an attempt result from stepID.
+func HasStepRuntimeOutputReference(raw, stepID string) bool {
+	return Field{}.HasStepRuntimeOutputReference(raw, stepID)
+}
+
+// HasStepRuntimeOutputReference reports whether raw, read as a value of the
+// field, reads an attempt result from stepID.
+func (f Field) HasStepRuntimeOutputReference(raw, stepID string) bool {
+	for _, ref := range scanReferences(raw, f.escapesDollar()) {
+		if ref.Kind != referenceEval {
+			continue
+		}
+		name, path, ok := referenceParts(ref.Raw)
+		if !ok || name != stepID || !isStepRuntimeOutputPath(path) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// unqualifiedItemFieldReferences returns each unescaped ${alias.field} token in
+// raw: a foreach item field written without the foreach namespace. Only fields
+// that ${foreach.alias.field} accepts unquoted are reported.
+func unqualifiedItemFieldReferences(raw, alias string, escapes bool) []string {
+	var tokens []string
+	for _, ref := range scanReferences(raw, escapes) {
+		if ref.Kind != referenceEval || !ref.Braced || ref.Raw != "${"+ref.Expr+"}" {
+			continue
+		}
+		if len(ref.Segments) == 2 && ref.Segments[0] == alias && validItemFieldSegment(ref.Segments[1]) {
+			tokens = append(tokens, ref.Raw)
+		}
+	}
+	return tokens
+}
+
+func isStepRuntimeOutputPath(path string) bool {
+	if strings.HasPrefix(path, ".output.") || strings.HasPrefix(path, ".output[") ||
+		strings.HasPrefix(path, ".outputs.") || strings.HasPrefix(path, ".outputs[") {
+		return true
+	}
+	property, _, err := parseStepReference(path)
+	if err != nil {
+		return false
+	}
+	switch property {
+	case ".stdout", ".stderr", ".exitCode", ".exit_code", ".output", ".outputs":
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseStepOutputReferenceToken parses an exact Spec 007 reference token.
+func ParseStepOutputReferenceToken(token string) (StepOutputReference, bool) {
+	if !strings.HasPrefix(token, "${") || !strings.HasSuffix(token, "}") {
+		return StepOutputReference{}, false
+	}
+	expr := strings.TrimSpace(token[2 : len(token)-1])
+	return parseStepOutputReference(classifyBracedReference(token, expr, 0, len(token)))
+}
+
+func validStepOutputStepName(name string) bool {
+	return bindingNamePattern.MatchString(name)
+}
+
+func validOutputPathSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for i, r := range segment {
+		if i == 0 {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_' {
+				continue
+			}
+			return false
+		}
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// validItemFieldSegment reports whether segment names a foreach item field
+// without quoting: a letter or underscore followed by letters, marks, digits,
+// or underscores, in any script.
+func validItemFieldSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for i, r := range segment {
+		switch {
+		case unicode.IsLetter(r) || r == '_':
+		case i > 0 && (unicode.IsMark(r) || unicode.IsDigit(r)):
+		default:
+			return false
+		}
+	}
+	return true
+}

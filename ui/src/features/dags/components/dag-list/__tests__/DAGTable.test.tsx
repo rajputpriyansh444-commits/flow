@@ -1,0 +1,702 @@
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
+import React from 'react';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Status, ViewSortField, ViewSortOrder } from '@/api/v1/schema';
+import { PanelWidthContext } from '@/components/SplitLayout';
+import { AppBarContext } from '@/contexts/AppBarContext';
+import { ConfigContext } from '@/contexts/ConfigContext';
+import { UserPreferencesProvider } from '@/contexts/UserPreference';
+import { I18nProvider } from '@/i18n/I18nProvider';
+import { WorkspaceKind } from '@/lib/workspace';
+import DAGTable from '../DAGTable';
+
+vi.mock('@/hooks/api', () => ({
+  useClient: () => ({ POST: vi.fn() }),
+  useQuery: () => ({
+    data: {
+      labels: ['team=ops'],
+    },
+  }),
+}));
+
+vi.mock('@/features/dags/components/common/DAGActions', () => ({
+  default: () => null,
+}));
+
+vi.mock('@/features/dags/components/common/LiveSwitch', () => ({
+  default: () => null,
+}));
+
+vi.mock('@/features/dags/components/common', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  DAGPagination: () => null,
+}));
+
+vi.mock('@/contexts/AuthContext', () => ({
+  useCanWrite: () => true,
+  useCanManageWebhooks: () => false,
+}));
+
+// Reads the locale from stored preferences, as the app does.
+function I18nWrapper({ children }: { children: React.ReactNode }) {
+  return (
+    <UserPreferencesProvider>
+      <I18nProvider>{children}</I18nProvider>
+    </UserPreferencesProvider>
+  );
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">{`${location.pathname}${location.search}`}</div>
+  );
+}
+
+function renderTable(
+  searchText = '',
+  options: {
+    dags?: React.ComponentProps<typeof DAGTable>['dags'];
+    workflowViews?: React.ComponentProps<typeof DAGTable>['workflowViews'];
+    activeWorkflowViewId?: string | null;
+    activeOnly?: boolean;
+    isAllWorkflowsView?: boolean;
+    panelWidth?: number | null;
+    canDeleteDAGs?: boolean;
+    canRenameDAGs?: boolean;
+    onDeleteDAGs?: React.ComponentProps<typeof DAGTable>['onDeleteDAGs'];
+    onRenameDAG?: (fileName: string, newFileName: string) => Promise<void>;
+    canPinDAG?: React.ComponentProps<typeof DAGTable>['canPinDAG'];
+  } = {}
+) {
+  const onShowAllWorkflows = vi.fn();
+  const handleActiveOnlyChange = vi.fn();
+  const onDeleteDAGs =
+    options.onDeleteDAGs ??
+    vi
+      .fn()
+      .mockImplementation(async (fileNames: string[]) =>
+        fileNames.map((fileName) => ({ fileName }))
+      );
+  const onRenameDAG =
+    options.onRenameDAG ?? vi.fn().mockResolvedValue(undefined);
+  const onSetDAGPinned = vi.fn().mockResolvedValue(undefined);
+  const result = render(
+    <MemoryRouter initialEntries={['/dags']}>
+      <LocationProbe />
+      <ConfigContext.Provider value={{ basePath: '' } as never}>
+        <AppBarContext.Provider
+          value={
+            {
+              selectedRemoteNode: 'local',
+              workspaceSelection: { kind: WorkspaceKind.all },
+            } as never
+          }
+        >
+          <PanelWidthContext.Provider value={options.panelWidth ?? null}>
+            <DAGTable
+              dags={
+                options.dags ?? [
+                  {
+                    fileName: 'example.yaml',
+                    dag: {
+                      name: searchText || 'example',
+                    },
+                    latestDAGRun: {
+                      status: Status.Success,
+                      statusLabel: 'Success',
+                    },
+                    suspended: false,
+                    errors: [],
+                  } as never,
+                ]
+              }
+              group=""
+              refreshFn={vi.fn()}
+              searchText={searchText}
+              handleSearchTextChange={vi.fn()}
+              searchLabels={[]}
+              handleSearchLabelsChange={vi.fn()}
+              activeOnly={options.activeOnly ?? false}
+              handleActiveOnlyChange={handleActiveOnlyChange}
+              sortField="name"
+              sortOrder="asc"
+              onSortChange={vi.fn()}
+              workflowViews={options.workflowViews ?? []}
+              activeWorkflowViewId={options.activeWorkflowViewId ?? null}
+              isAllWorkflowsView={options.isAllWorkflowsView ?? true}
+              isWorkflowViewEdited={false}
+              canManageWorkflowViews={true}
+              canDeleteDAGs={options.canDeleteDAGs ?? true}
+              canRenameDAGs={options.canRenameDAGs ?? true}
+              onSelectWorkflowView={vi.fn()}
+              onShowAllWorkflows={onShowAllWorkflows}
+              onResetWorkflowView={vi.fn()}
+              onSaveWorkflowView={vi.fn()}
+              onUpdateWorkflowView={vi.fn()}
+              onSetDefaultWorkflowView={vi.fn()}
+              onSetPinnedWorkflowView={vi.fn()}
+              onDeleteWorkflowView={vi.fn()}
+              onDeleteDAGs={onDeleteDAGs}
+              onRenameDAG={onRenameDAG}
+              canPinDAG={options.canPinDAG ?? (() => true)}
+              onSetDAGPinned={onSetDAGPinned}
+            />
+          </PanelWidthContext.Provider>
+        </AppBarContext.Provider>
+      </ConfigContext.Provider>
+    </MemoryRouter>,
+    { wrapper: I18nWrapper }
+  );
+  return {
+    ...result,
+    handleActiveOnlyChange,
+    onDeleteDAGs,
+    onRenameDAG,
+    onSetDAGPinned,
+    onShowAllWorkflows,
+  };
+}
+
+function workflow({
+  name,
+  group,
+  pinned = false,
+  status = Status.Success,
+}: {
+  name: string;
+  group?: string;
+  pinned?: boolean;
+  status?: Status;
+}): React.ComponentProps<typeof DAGTable>['dags'][number] {
+  return {
+    fileName: `${name}.yaml`,
+    dag: { name, group },
+    latestDAGRun: { status, statusLabel: Status[status] },
+    suspended: false,
+    pinned,
+    errors: [],
+  } as never;
+}
+
+// Text of each body row, so tests can check the order rows appear in.
+function bodyRowTexts(table: HTMLElement): string[] {
+  return within(table)
+    .getAllByRole('row')
+    .slice(1)
+    .map((row) => row.textContent ?? '');
+}
+
+describe('DAGTable', () => {
+  beforeEach(() => {
+    vi.stubGlobal('getConfig', () => ({
+      tz: 'UTC',
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it('links workflow names to their canonical detail pages', () => {
+    renderTable();
+
+    for (const link of screen.getAllByRole('link', { name: 'example' })) {
+      expect(link).toHaveAttribute(
+        'href',
+        '/dags/example.yaml?remoteNode=local'
+      );
+    }
+  });
+
+  it('uses the same control surface sizing as the executions page', () => {
+    renderTable();
+
+    const searchInput = screen.getByPlaceholderText(
+      'Filter by workflow name...'
+    );
+    expect(searchInput.className).toContain('h-9');
+    expect(searchInput.className).toContain('w-[200px]');
+
+    const controlSurface = searchInput.closest(
+      '[data-testid="workflow-controls"]'
+    );
+    expect(controlSurface?.className).toContain('mb-4');
+
+    const labelInput = screen.getByRole('combobox', {
+      name: 'Filter by labels...',
+    });
+    expect(labelInput.parentElement?.className).toContain('min-h-9');
+    expect(labelInput.parentElement?.className).toContain('bg-card');
+  });
+
+  it('links grep to the global DAG search with the current workflow keyword', () => {
+    renderTable('daily backup');
+
+    expect(screen.getByRole('link', { name: 'Grep' })).toHaveAttribute(
+      'href',
+      '/search?q=daily+backup&scope=dags'
+    );
+  });
+
+  it('toggles the active workflow filter', () => {
+    const { handleActiveOnlyChange, unmount } = renderTable();
+
+    const activeOnlySwitch = screen.getByRole('switch', {
+      name: 'Active only',
+    });
+    expect(activeOnlySwitch).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(activeOnlySwitch);
+    expect(handleActiveOnlyChange).toHaveBeenCalledWith(true);
+
+    unmount();
+    renderTable('', { activeOnly: true });
+    expect(screen.getByRole('switch', { name: 'Active only' })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+  });
+
+  it('hides workflow mutation controls without write permission', () => {
+    renderTable('', { canDeleteDAGs: false, canRenameDAGs: false });
+
+    const table = screen.getByRole('table');
+    expect(
+      within(table).queryByRole('checkbox', {
+        name: 'Select all loaded workflows',
+      })
+    ).not.toBeInTheDocument();
+    expect(
+      within(table).queryByRole('button', { name: 'Rename workflow example' })
+    ).not.toBeInTheDocument();
+    expect(
+      within(table).queryByRole('button', { name: 'Delete workflow example' })
+    ).not.toBeInTheDocument();
+  });
+
+  it('selects only workflows visible through the client-side filter', async () => {
+    renderTable('alpha', {
+      dags: [
+        {
+          fileName: 'alpha.yaml',
+          dag: { name: 'alpha' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+        {
+          fileName: 'beta.yaml',
+          dag: { name: 'beta' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+      ],
+    });
+
+    const table = screen.getByRole('table');
+    await waitFor(() => {
+      expect(within(table).queryByText('beta')).not.toBeInTheDocument();
+    });
+    fireEvent.click(
+      within(table).getByRole('checkbox', {
+        name: 'Select all loaded workflows',
+      })
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Delete (1)' }));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('alpha.yaml');
+    expect(dialog).not.toHaveTextContent('beta.yaml');
+  });
+
+  it('selects loaded workflows and deletes them after confirmation', async () => {
+    const { onDeleteDAGs } = renderTable('', {
+      dags: [
+        {
+          fileName: 'alpha.yaml',
+          dag: { name: 'alpha' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+        {
+          fileName: 'beta.yaml',
+          dag: { name: 'beta' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+      ],
+    });
+
+    expect(
+      screen.queryByRole('button', { name: /^Delete \(/ })
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole('table')).getByRole('checkbox', {
+        name: 'Select all loaded workflows',
+      })
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Delete (2)' }));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Delete 2 workflows?');
+    expect(dialog).toHaveTextContent('alpha.yaml');
+    expect(dialog).toHaveTextContent('beta.yaml');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => {
+      expect(onDeleteDAGs).toHaveBeenCalledWith(['alpha.yaml', 'beta.yaml']);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole('button', { name: /^Delete \(/ })
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps failed workflows selected with their individual errors', async () => {
+    const onDeleteDAGs = vi
+      .fn()
+      .mockResolvedValue([
+        { fileName: 'alpha.yaml' },
+        { fileName: 'beta.yaml', error: 'permission denied' },
+      ]);
+    renderTable('', {
+      dags: [
+        {
+          fileName: 'alpha.yaml',
+          dag: { name: 'alpha' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+        {
+          fileName: 'beta.yaml',
+          dag: { name: 'beta' },
+          latestDAGRun: {
+            status: Status.Success,
+            statusLabel: 'Success',
+          },
+          suspended: false,
+          errors: [],
+        } as never,
+      ],
+      onDeleteDAGs,
+    });
+
+    fireEvent.click(
+      within(screen.getByRole('table')).getByRole('checkbox', {
+        name: 'Select all loaded workflows',
+      })
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Delete (2)' }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' })
+    );
+
+    await waitFor(() => {
+      const dialog = screen.getByRole('dialog');
+      expect(dialog).not.toHaveTextContent('alpha.yaml');
+      expect(dialog).toHaveTextContent('beta.yaml');
+      expect(dialog).toHaveTextContent('permission denied');
+    });
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' })
+    );
+    expect(screen.getByRole('button', { name: 'Delete (1)' })).toBeEnabled();
+  });
+
+  it('renames a workflow from the actions column', async () => {
+    const { onRenameDAG } = renderTable();
+
+    fireEvent.click(
+      within(screen.getByRole('table')).getByRole('button', {
+        name: 'Rename workflow example',
+      })
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Rename workflow');
+    const nameInput = within(dialog).getByLabelText('Workflow name');
+    expect(nameInput).toHaveValue('example.yaml');
+    fireEvent.change(nameInput, { target: { value: 'renamed.yaml' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Rename' }));
+
+    await waitFor(() => {
+      expect(onRenameDAG).toHaveBeenCalledWith('example.yaml', 'renamed.yaml');
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('deletes a workflow from the actions column after confirmation', async () => {
+    const { onDeleteDAGs } = renderTable();
+
+    fireEvent.click(
+      within(screen.getByRole('table')).getByRole('button', {
+        name: 'Delete workflow example',
+      })
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('Delete workflow?');
+    expect(dialog).toHaveTextContent('example.yaml');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => {
+      expect(onDeleteDAGs).toHaveBeenCalledWith(['example.yaml']);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('invites creating the first workflow when none exist and no filters are set', () => {
+    renderTable('', { dags: [] });
+
+    expect(screen.getAllByText('No workflows yet').length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText('Create your first workflow to get started.').length
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText('No workflows found')).not.toBeInTheDocument();
+    // All workspaces, the default selection, still allows creating one.
+    expect(
+      screen.getAllByRole('button', { name: 'Create new DAG' }).length
+    ).toBeGreaterThan(0);
+  });
+
+  it('translates the empty state', () => {
+    localStorage.setItem('user_preferences', JSON.stringify({ locale: 'ja' }));
+
+    renderTable('', { dags: [] });
+
+    expect(
+      screen.getAllByText('ワークフローはまだありません').length
+    ).toBeGreaterThan(0);
+  });
+
+  it('explains an empty saved view and offers to show all workflows', () => {
+    const { onShowAllWorkflows } = renderTable('', {
+      dags: [],
+      workflowViews: [
+        {
+          id: 'production',
+          name: 'Production operations',
+          pinned: false,
+          filters: {
+            searchText: '',
+            searchLabels: ['env=prod'],
+            activeOnly: false,
+            sortField: ViewSortField.name,
+            sortOrder: ViewSortOrder.asc,
+          },
+        },
+      ],
+      activeWorkflowViewId: 'production',
+      isAllWorkflowsView: false,
+      panelWidth: 600,
+    });
+
+    expect(screen.getAllByText('No workflows found').length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(/No workflows match the “Production operations” view/)
+        .length
+    ).toBeGreaterThan(0);
+
+    const cardView = screen.getByTestId('workflow-card-view');
+    expect(cardView.className).toContain('block');
+    fireEvent.click(
+      within(cardView).getByRole('button', { name: 'Show all workflows' })
+    );
+    expect(onShowAllWorkflows).toHaveBeenCalledOnce();
+  });
+
+  // A pinned workflow leaves its group so it stays visible at the top.
+  it('lists pinned workflows first in their own section', () => {
+    renderTable('', {
+      dags: [
+        workflow({ name: 'reports', group: 'nightly', pinned: true }),
+        workflow({ name: 'alpha' }),
+        workflow({ name: 'cleanup', group: 'nightly' }),
+      ],
+    });
+
+    const table = screen.getByRole('table');
+    const texts = bodyRowTexts(table);
+    const position = (text: string) =>
+      texts.findIndex((rowText) => rowText.includes(text));
+    expect(position('Pinned')).toBe(0);
+    expect(position('reports')).toBe(1);
+    expect(position('nightly')).toBeGreaterThan(position('reports'));
+    expect(position('alpha')).toBeGreaterThan(position('nightly'));
+    expect(
+      within(table).getAllByRole('link', { name: 'reports' })
+    ).toHaveLength(1);
+  });
+
+  it('shows no pinned section when no visible workflow is pinned', () => {
+    renderTable();
+
+    expect(
+      within(screen.getByRole('table')).queryByText('Pinned')
+    ).not.toBeInTheDocument();
+  });
+
+  // Ascending status order alone would put the failed workflow first.
+  it('keeps pinned workflows on top when sorting by status', () => {
+    renderTable('', {
+      dags: [
+        workflow({ name: 'zeta', pinned: true, status: Status.Success }),
+        workflow({ name: 'alpha', status: Status.Failed }),
+      ],
+    });
+    const table = screen.getByRole('table');
+
+    fireEvent.click(within(table).getByRole('button', { name: /^Status/ }));
+
+    const texts = bodyRowTexts(table);
+    expect(texts.findIndex((text) => text.includes('zeta'))).toBeLessThan(
+      texts.findIndex((text) => text.includes('alpha'))
+    );
+  });
+
+  it('pins and unpins workflows from their rows', () => {
+    const { onSetDAGPinned } = renderTable('', {
+      dags: [
+        workflow({ name: 'reports', pinned: true }),
+        workflow({ name: 'alpha' }),
+      ],
+    });
+    const table = screen.getByRole('table');
+
+    const pinAlpha = within(table).getByRole('button', {
+      name: 'Pin workflow alpha',
+    });
+    expect(pinAlpha).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(pinAlpha);
+    fireEvent.click(
+      within(table).getByRole('button', { name: 'Pin workflow reports' })
+    );
+
+    expect(onSetDAGPinned).toHaveBeenNthCalledWith(1, 'alpha.yaml', true);
+    expect(onSetDAGPinned).toHaveBeenNthCalledWith(2, 'reports.yaml', false);
+  });
+
+  it('marks pinned workflows without a pin button for read-only users', () => {
+    renderTable('', {
+      canPinDAG: (dag) => dag.fileName === 'alpha.yaml',
+      dags: [
+        workflow({ name: 'reports', pinned: true }),
+        workflow({ name: 'alpha' }),
+      ],
+    });
+    const table = screen.getByRole('table');
+
+    expect(within(table).getByRole('img', { name: 'Pinned' })).toBeVisible();
+    expect(
+      within(table).queryByRole('button', { name: 'Pin workflow reports' })
+    ).not.toBeInTheDocument();
+    expect(
+      within(table).getByRole('button', { name: 'Pin workflow alpha' })
+    ).toBeInTheDocument();
+  });
+
+  it('shows the pinned section and pin buttons in the card view', () => {
+    renderTable('', {
+      panelWidth: 600,
+      dags: [
+        workflow({ name: 'reports', pinned: true }),
+        workflow({ name: 'alpha' }),
+      ],
+    });
+    const cards = screen.getByTestId('workflow-card-view');
+
+    expect(within(cards).getByText('Pinned')).toBeInTheDocument();
+    expect(
+      within(cards).getByRole('button', { name: 'Pin workflow reports' })
+    ).toHaveAttribute('aria-pressed', 'true');
+    expect(
+      within(cards).getByRole('button', { name: 'Pin workflow alpha' })
+    ).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('opens the workflow page when a row is clicked', () => {
+    renderTable('', {
+      dags: [workflow({ name: 'alpha' }), workflow({ name: 'reports' })],
+    });
+    const table = screen.getByRole('table');
+
+    fireEvent.click(
+      within(table).getByRole('link', { name: 'reports' }).closest('tr')!
+    );
+
+    expect(screen.getByTestId('location')).toHaveTextContent(
+      '/dags/reports.yaml?remoteNode=local'
+    );
+  });
+
+  it('opens the workflow page when a card is clicked', () => {
+    renderTable('', {
+      panelWidth: 600,
+      dags: [workflow({ name: 'alpha' }), workflow({ name: 'reports' })],
+    });
+    const cards = screen.getByTestId('workflow-card-view');
+
+    fireEvent.click(
+      within(cards)
+        .getByRole('link', { name: 'alpha' })
+        .closest('.card-obsidian')!
+    );
+
+    expect(screen.getByTestId('location')).toHaveTextContent(
+      '/dags/alpha.yaml?remoteNode=local'
+    );
+  });
+
+  it('opens a new tab on Ctrl click and keeps the list', () => {
+    const openMock = vi.spyOn(window, 'open').mockImplementation(() => null);
+    renderTable('', { dags: [workflow({ name: 'alpha' })] });
+    const table = screen.getByRole('table');
+
+    fireEvent.click(
+      within(table).getByRole('link', { name: 'alpha' }).closest('tr')!,
+      { ctrlKey: true }
+    );
+
+    expect(openMock).toHaveBeenCalledWith(
+      '/dags/alpha.yaml?remoteNode=local',
+      '_blank',
+      'noopener'
+    );
+    expect(screen.getByTestId('location')).toHaveTextContent('/dags');
+    expect(screen.getByTestId('location')).not.toHaveTextContent('alpha');
+    openMock.mockRestore();
+  });
+});

@@ -1,0 +1,238 @@
+package auth
+
+import (
+	"context"
+	"errors"
+)
+
+// Common errors for user store operations.
+var (
+	// ErrUserNotFound is returned when a user cannot be found.
+	ErrUserNotFound = errors.New("user not found")
+	// ErrUserAlreadyExists is returned when attempting to create a user
+	// with a username that already exists.
+	ErrUserAlreadyExists = errors.New("user already exists")
+	// ErrUserDisabled is returned when an operation requires an enabled user.
+	ErrUserDisabled = errors.New("your account has been disabled, contact administrator")
+	// ErrInvalidUsername is returned when the username is invalid.
+	ErrInvalidUsername = errors.New("invalid username")
+	// ErrInvalidUserID is returned when the user ID is invalid.
+	ErrInvalidUserID = errors.New("invalid user ID")
+	// ErrOIDCIdentityNotFound is returned when an OIDC identity cannot be found.
+	ErrOIDCIdentityNotFound = errors.New("OIDC identity not found")
+	// ErrOIDCIdentityAlreadyExists is returned when attempting to create a user
+	// with an OIDC identity that already exists.
+	ErrOIDCIdentityAlreadyExists = errors.New("OIDC identity already exists")
+	// ErrTrustedProxyIdentityNotFound is returned when a proxy identity cannot be found.
+	ErrTrustedProxyIdentityNotFound = errors.New("proxy identity not found")
+	// ErrTrustedProxyIdentityAlreadyExists is returned when attempting to create a user
+	// with a proxy identity that already exists.
+	ErrTrustedProxyIdentityAlreadyExists = errors.New("proxy identity already exists")
+	// ErrInvalidTrustedProxyIdentity is returned when the provider and trusted identity are inconsistent.
+	ErrInvalidTrustedProxyIdentity = errors.New("invalid proxy identity")
+	// ErrTrustedProxyIdentityImmutable is returned when an existing trusted identity is changed.
+	ErrTrustedProxyIdentityImmutable = errors.New("proxy identity is immutable")
+)
+
+// Common errors for API key store operations.
+var (
+	// ErrAPIKeyNotFound is returned when an API key cannot be found.
+	ErrAPIKeyNotFound = errors.New("API key not found")
+	// ErrAPIKeyAlreadyExists is returned when attempting to create an API key
+	// with a name that already exists.
+	ErrAPIKeyAlreadyExists = errors.New("API key already exists")
+	// ErrInvalidAPIKeyName is returned when the API key name is invalid.
+	ErrInvalidAPIKeyName = errors.New("invalid API key name")
+	// ErrInvalidAPIKeyID is returned when the API key ID is invalid.
+	ErrInvalidAPIKeyID = errors.New("invalid API key ID")
+	// ErrInvalidAPIKeyHash is returned when the API key hash is empty.
+	ErrInvalidAPIKeyHash = errors.New("invalid API key hash")
+	// ErrInvalidAPIKeySurface is returned when the API key surface allowlist is invalid.
+	ErrInvalidAPIKeySurface = errors.New("invalid API key surface")
+	// ErrInvalidAPIKeyAttribution is returned when API key attribution metadata is invalid.
+	ErrInvalidAPIKeyAttribution = errors.New("invalid API key attribution")
+	// ErrInvalidRole is returned when the role is not a valid role.
+	ErrInvalidRole = errors.New("invalid role")
+)
+
+// Common errors for webhook store operations.
+var (
+	// ErrWebhookNotFound is returned when a webhook cannot be found.
+	ErrWebhookNotFound = errors.New("webhook not found")
+	// ErrWebhookAlreadyExists is returned when attempting to create a webhook
+	// for a DAG that already has one.
+	ErrWebhookAlreadyExists = errors.New("webhook already exists for this DAG")
+	// ErrInvalidWebhookDAGName is returned when the DAG name is invalid.
+	ErrInvalidWebhookDAGName = errors.New("invalid webhook DAG name")
+	// ErrInvalidWebhookID is returned when the webhook ID is invalid.
+	ErrInvalidWebhookID = errors.New("invalid webhook ID")
+	// ErrInvalidWebhookTokenHash is returned when the webhook token hash is empty.
+	ErrInvalidWebhookTokenHash = errors.New("invalid webhook token hash")
+	// ErrWebhookHMACEncryptorRequired is returned when encrypted HMAC secret
+	// storage is required but no encryptor is available.
+	ErrWebhookHMACEncryptorRequired = errors.New("webhook HMAC secret requires encryptor")
+	// ErrWebhookHMACDecryptFailed is returned when an encrypted HMAC secret
+	// cannot be decrypted from storage.
+	ErrWebhookHMACDecryptFailed = errors.New("failed to decrypt webhook HMAC secret")
+	// ErrWebhookPublicEncryptorRequired is returned when a public webhook URL
+	// is stored or read without an encryptor for its token and sender secret.
+	ErrWebhookPublicEncryptorRequired = errors.New("webhook public URL requires encryptor")
+	// ErrWebhookPublicDecryptFailed is returned when a public webhook URL's
+	// token or sender secret cannot be decrypted.
+	ErrWebhookPublicDecryptFailed = errors.New("failed to decrypt webhook public URL secrets")
+)
+
+// UserStore defines the interface for user persistence operations.
+// Implementations must be safe for concurrent use.
+type UserStore interface {
+	// Create stores a new user.
+	// Returns ErrUserAlreadyExists if a user with the same username exists.
+	Create(ctx context.Context, user *User) error
+
+	// GetByID retrieves a user by their unique ID.
+	// Returns ErrUserNotFound if the user does not exist.
+	GetByID(ctx context.Context, id string) (*User, error)
+
+	// GetByUsername retrieves a user by their username.
+	// Returns ErrUserNotFound if the user does not exist.
+	GetByUsername(ctx context.Context, username string) (*User, error)
+
+	// GetByOIDCIdentity retrieves a user by their OIDC identity (issuer + subject).
+	// Returns ErrOIDCIdentityNotFound if no user exists with the given OIDC identity.
+	GetByOIDCIdentity(ctx context.Context, issuer, subject string) (*User, error)
+
+	// GetByTrustedProxyIdentity retrieves a user by their proxy identity source and user.
+	// Returns ErrTrustedProxyIdentityNotFound if no user exists with the given identity.
+	GetByTrustedProxyIdentity(ctx context.Context, source, user string) (*User, error)
+
+	// List returns all users in the store.
+	List(ctx context.Context) ([]*User, error)
+
+	// Update modifies an existing user.
+	// Returns ErrUserNotFound if the user does not exist.
+	Update(ctx context.Context, user *User) error
+
+	// Patch atomically applies the non-nil fields in patch to an existing user.
+	// Returns the stored user after the update.
+	Patch(ctx context.Context, id string, patch UserPatch) (*User, error)
+
+	// Delete removes a user by their ID.
+	// Returns ErrUserNotFound if the user does not exist.
+	Delete(ctx context.Context, id string) error
+
+	// Count returns the total number of users.
+	Count(ctx context.Context) (int64, error)
+}
+
+// UserPatch contains independently updateable account fields.
+type UserPatch struct {
+	Username        *string
+	Role            *Role
+	WorkspaceAccess *WorkspaceAccess
+	PasswordHash    *string
+	IsDisabled      *bool
+}
+
+// AuthorizationSyncResult describes an atomic authorization synchronization.
+type AuthorizationSyncResult struct {
+	// User is the current stored user.
+	User *User
+	// Changed reports whether the synchronization modified authorization.
+	Changed bool
+	// PreviousRole is the role observed immediately before synchronization.
+	PreviousRole Role
+	// PreviousWorkspaceAccess is the workspace policy observed immediately before synchronization.
+	PreviousWorkspaceAccess *WorkspaceAccess
+}
+
+// AuthorizationSyncUserStore atomically synchronizes externally managed authorization.
+type AuthorizationSyncUserStore interface {
+	UserStore
+
+	// SyncAuthorization updates role and, when non-nil, workspace access on an enabled user.
+	// It returns the current user and the authorization state observed under the same lock.
+	SyncAuthorization(ctx context.Context, id string, role Role, workspaceAccess *WorkspaceAccess) (AuthorizationSyncResult, error)
+}
+
+// APIKeyStore defines the interface for API key persistence operations.
+// Implementations must be safe for concurrent use.
+type APIKeyStore interface {
+	// Create stores a new API key.
+	// Returns ErrAPIKeyAlreadyExists if an API key with the same name exists.
+	Create(ctx context.Context, key *APIKey) error
+
+	// GetByID retrieves an API key by its unique ID.
+	// Returns ErrAPIKeyNotFound if the API key does not exist.
+	GetByID(ctx context.Context, id string) (*APIKey, error)
+
+	// GetByDigest retrieves an API key by its credential digest.
+	// Returns ErrAPIKeyNotFound if the API key does not exist.
+	GetByDigest(ctx context.Context, digest string) (*APIKey, error)
+
+	// List returns all API keys in the store.
+	List(ctx context.Context) ([]*APIKey, error)
+
+	// Update modifies an existing API key.
+	// Credential fields and a newer LastUsedAt value in storage are preserved.
+	// Returns ErrAPIKeyNotFound if the API key does not exist.
+	Update(ctx context.Context, key *APIKey) error
+
+	// Delete removes an API key by its ID.
+	// Returns ErrAPIKeyNotFound if the API key does not exist.
+	Delete(ctx context.Context, id string) error
+
+	// PromoteDigest atomically assigns a credential digest to an API key.
+	// Repeating the promotion with the same digest is idempotent.
+	PromoteDigest(ctx context.Context, id, digest string) error
+
+	// UpdateLastUsed records recent API key use without persisting more than once per minute.
+	UpdateLastUsed(ctx context.Context, id string) error
+}
+
+// WebhookStore defines the interface for webhook persistence operations.
+// Implementations must be safe for concurrent use.
+// Each DAG can have at most one webhook (1:1 relationship).
+type WebhookStore interface {
+	// Create stores a new webhook.
+	// Returns ErrWebhookAlreadyExists if a webhook for the DAG already exists.
+	Create(ctx context.Context, webhook *Webhook) error
+
+	// GetByID retrieves a webhook by its unique ID.
+	// Returns ErrWebhookNotFound if the webhook does not exist.
+	GetByID(ctx context.Context, id string) (*Webhook, error)
+
+	// GetByDAGName retrieves the webhook for a specific DAG.
+	// Returns ErrWebhookNotFound if no webhook exists for the DAG.
+	GetByDAGName(ctx context.Context, dagName string) (*Webhook, error)
+
+	// List returns all webhooks in the store.
+	List(ctx context.Context) ([]*Webhook, error)
+
+	// UpdateByDAGName applies mutate to the current webhook for a DAG and
+	// stores the result atomically with respect to other writes, including
+	// writes from other processes sharing the store, so concurrent updates
+	// never overwrite each other. mutate may run more than once when a
+	// concurrent write intervenes, so it must only modify the webhook it is
+	// given. An error from mutate aborts the update and is returned unchanged.
+	// Returns ErrWebhookNotFound if no webhook exists for the DAG.
+	UpdateByDAGName(ctx context.Context, dagName string, mutate func(*Webhook) error) (*Webhook, error)
+
+	// Delete removes a webhook by its ID.
+	// Returns ErrWebhookNotFound if the webhook does not exist.
+	Delete(ctx context.Context, id string) error
+
+	// DeleteByDAGName removes a webhook by its DAG name.
+	// Returns ErrWebhookNotFound if no webhook exists for the DAG.
+	DeleteByDAGName(ctx context.Context, dagName string) error
+
+	// RenameDAG moves a DAG's webhook to the DAG's new name, keeping its
+	// tokens and settings.
+	// Returns ErrWebhookAlreadyExists if a webhook exists for newName,
+	// checked first, and ErrWebhookNotFound if none exists for oldName.
+	RenameDAG(ctx context.Context, oldName, newName string) error
+
+	// UpdateLastUsed records recent use of a webhook and, when profileTokenID
+	// is not empty, of that profile token, persisting each timestamp at most
+	// once per minute. This is called when the webhook is triggered.
+	UpdateLastUsed(ctx context.Context, id, profileTokenID string) error
+}

@@ -1,0 +1,502 @@
+package spec006_env_test
+
+import (
+	"os/exec"
+	"runtime"
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/conformance/harness"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidate(t *testing.T) {
+	t.Parallel()
+
+	validCases := []string{
+		"env_forms_order.yaml",
+		"single_quoted_env_references.yaml",
+		"shell_style_env_expressions.yaml",
+		"braced_non_env_text.yaml",
+		"shell_run_boundary.yaml",
+	}
+	for _, file := range validCases {
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", file)
+			result.ExpectExitCode(0)
+			result.ExpectStdout("")
+			result.ExpectStderr("")
+			flow.ExpectNoFile("executed.txt")
+		})
+	}
+
+	successOnlyCases := []string{
+		"direct_execution_env_expansion.yaml",
+	}
+	for _, file := range successOnlyCases {
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", file)
+			result.ExpectExitCode(0)
+			result.ExpectStdout("")
+			flow.ExpectNoFile("executed.txt")
+		})
+	}
+
+	noticeCases := []struct {
+		name        string
+		file        string
+		stderrParts []string
+	}{
+		{
+			name:        "self env reference notice",
+			file:        "env_top_to_bottom.yaml",
+			stderrParts: []string{"${env.SELF}", "was left unchanged", "env"},
+		},
+		{
+			name:        "later env reference notice",
+			file:        "env_top_to_bottom.yaml",
+			stderrParts: []string{"$AFTER", "was left unchanged", "env"},
+		},
+		{
+			name:        "container self env reference notice",
+			file:        "container_env_ordering.yaml",
+			stderrParts: []string{"${env.SELF}", "was left unchanged", "container.env"},
+		},
+		{
+			name:        "missing Flow env reference notice",
+			file:        "missing_env_references.yaml",
+			stderrParts: []string{"${env.MISSING}", "was left unchanged", "steps[0].run"},
+		},
+		{
+			name:        "root env runtime param source notice",
+			file:        "root_env_sources.yaml",
+			stderrParts: []string{"${params.target}", "was left unchanged", "env"},
+		},
+		{
+			name:        "step env runtime param source notice",
+			file:        "step_env_sources.yaml",
+			stderrParts: []string{"${params.target}", "was left unchanged", "steps[1].env"},
+		},
+		{
+			name:        "validate does not require runtime env source",
+			file:        "validate_missing_runtime_sources.yaml",
+			stderrParts: []string{"${env.RUNTIME_ONLY}", "was left unchanged", "steps[1].run"},
+		},
+		{
+			name:        "validate does not require process env source",
+			file:        "validate_missing_runtime_sources.yaml",
+			stderrParts: []string{"${env.PROCESS_ONLY}", "was left unchanged", "steps[1].run"},
+		},
+		{
+			name:        "validate does not require dotenv env source",
+			file:        "validate_missing_runtime_sources.yaml",
+			stderrParts: []string{"${env.DOTENV_ONLY}", "was left unchanged", "steps[1].run"},
+		},
+		{
+			name:        "validate does not require current step managed source",
+			file:        "current_step_managed_env.yaml",
+			stderrParts: []string{"${env.DAG_RUN_STEP_NAME}", "was left unchanged", "steps[0].env"},
+		},
+		{
+			name:        "validate does not require current step stdout source",
+			file:        "current_step_managed_env.yaml",
+			stderrParts: []string{"${env.DAG_RUN_STEP_STDOUT_FILE}", "was left unchanged", "steps[0].env"},
+		},
+		{
+			name:        "validate does not require current step output file source",
+			file:        "current_step_managed_env.yaml",
+			stderrParts: []string{"${env.FLOW_OUTPUT_FILE}", "was left unchanged", "steps[0].env"},
+		},
+	}
+	for _, tc := range noticeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			// Their availability depends on runtime values or lifecycle scope,
+			// so validation stays quiet about them by default.
+			result := flow.Run("validate", "--show-unresolved", tc.file)
+			result.ExpectExitCode(0)
+			result.ExpectStdout("")
+			result.ExpectStderrContains(tc.stderrParts...)
+			flow.ExpectNoFile("executed.txt")
+		})
+	}
+
+	invalidCases := []struct {
+		name        string
+		file        string
+		stderrParts []string
+	}{
+		{
+			name:        "invalid env declaration name",
+			file:        "invalid_env_declaration_name.yaml",
+			stderrParts: []string{"env", "1INVALID"},
+		},
+		{
+			name:        "invalid env declaration shape",
+			file:        "invalid_env_declaration_shape.yaml",
+			stderrParts: []string{"env", "map or array"},
+		},
+		{
+			name:        "invalid env list entry",
+			file:        "invalid_env_list_entry.yaml",
+			stderrParts: []string{"env", "MISSING_EQUALS"},
+		},
+		{
+			name:        "invalid secret managed name",
+			file:        "invalid_secret_managed_name.yaml",
+			stderrParts: []string{"secrets", "DAG_RUN_ID", "collides"},
+		},
+		{
+			name:        "invalid secret execution attempt name",
+			file:        "invalid_secret_execution_attempt_name.yaml",
+			stderrParts: []string{"secrets", "DAG_RUN_STEP_STDOUT_FILE", "collides"},
+		},
+		{
+			name:        "invalid secret FLOW output file name",
+			file:        "invalid_secret_flow_output_file_name.yaml",
+			stderrParts: []string{"secrets", "FLOW_OUTPUT_FILE"},
+		},
+		{
+			name:        "invalid secret FLOW prefix name",
+			file:        "invalid_secret_flow_prefix_name.yaml",
+			stderrParts: []string{"secrets", "FLOW_CUSTOM", "must not start with FLOW_"},
+		},
+		{
+			name:        "invalid secret pushback managed name",
+			file:        "invalid_secret_pushback_name.yaml",
+			stderrParts: []string{"secrets", "DAG_PUSHBACK", "collides"},
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", tc.file)
+			result.ExpectExitCode(1)
+			result.ExpectStdout("")
+			result.ExpectStderrContains(tc.stderrParts...)
+			result.ExpectStderrNotContains("Usage:")
+			flow.ExpectNoFile("executed.txt")
+		})
+	}
+}
+
+func TestRuntime(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		file    string
+		args    []string
+		output  string
+		content string
+		setup   func(*testing.T, *harness.Runner)
+	}{
+		{
+			name:    "env declaration forms preserve order",
+			file:    "env_forms_order.yaml",
+			output:  "env-forms.txt",
+			content: "SERVICE=api\nHOST=api.internal\n",
+		},
+		{
+			name:    "env entries evaluate top to bottom",
+			file:    "env_top_to_bottom.yaml",
+			output:  "env-order.txt",
+			content: "SERVICE=api\nHOST=api.internal\nSELF=${env.SELF}\nLATER=$AFTER\n",
+		},
+		{
+			name:    "missing env references stay literal",
+			file:    "missing_env_references.yaml",
+			output:  "missing-env.txt",
+			content: "${env.MISSING}\n$MISSING\n${MISSING}\n",
+		},
+		{
+			name:    "root env reads consts and runtime params",
+			file:    "root_env_sources.yaml",
+			args:    []string{"start", "--params", "target=prod", "root_env_sources.yaml"},
+			output:  "root-sources.txt",
+			content: "COLOR=blue\nTARGET=prod\n",
+		},
+		{
+			name:    "step env reads all allowed sources",
+			file:    "step_env_sources.yaml",
+			args:    []string{"start", "--params", "target=prod", "step_env_sources.yaml"},
+			output:  "step-env-sources.txt",
+			content: "CONST=blue\nPARAM=prod\nROOT=api\nEARLIER=seed\nPREVIOUS=step-value\n",
+		},
+		{
+			name:    "single quoted env references stay literal",
+			file:    "single_quoted_env_references.yaml",
+			output:  "single-quoted.txt",
+			content: "'$SERVICE'\n'${SERVICE}'\n'api'\n",
+		},
+		{
+			name:    "shell style expressions resolve or stay literal",
+			file:    "shell_style_env_expressions.yaml",
+			output:  "shell-style.txt",
+			content: "api\nfallback\nxx\nalternate\nxx\npi\n3\nteam/api.tar.gz\napi.tar.gz\nregistry/team/api.tar\nregistry\napi\nregistry/team/api.tar.gz\napi.tar.gz\nregistry/team/api.tar\napi\napi\n${MISSING:-default}\n${MISSING:4:10}\n${MISSING:=default}\n",
+		},
+		{
+			name:    "assignment-like shell expression preserves shell-style field when assignment would be required",
+			file:    "shell_style_assignment_preserves_field.yaml",
+			output:  "shell-style-assignment.txt",
+			content: "api\napi\napi\n${SERVICE:-fallback}\n${EMPTY:=fallback}\n${EMPTY:-fallback}\nxx\n",
+		},
+		{
+			name:    "unsupported braced text stays ordinary content",
+			file:    "braced_non_env_text.yaml",
+			output:  "braced-text.txt",
+			content: "${not.env}\n${env}\n",
+		},
+		{
+			name:    "shell backed run preserves shell owned env syntax",
+			file:    "shell_run_boundary.yaml",
+			output:  "shell-boundary.txt",
+			content: "shell api\n",
+		},
+		{
+			name:    "direct execution has no later shell expansion",
+			file:    "direct_execution_env_expansion.yaml",
+			output:  "direct-exec.txt",
+			content: "api ${MISSING}\n",
+			setup:   buildArgWriter,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			if tc.setup != nil {
+				tc.setup(t, flow)
+			}
+			args := tc.args
+			if len(args) == 0 {
+				args = []string{"start", tc.file}
+			}
+			result := flow.Run(args...)
+			result.ExpectExitCode(0)
+			flow.ExpectFileContent(tc.output, tc.content)
+		})
+	}
+
+	t.Run("protected run env is restored before step local shadowing", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "protected_env_shadowing.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent(
+			"protected-shadowing.txt",
+			"root-env-read-workflow-shadow\nDAG_RUN_ID=step-shadow\nSTEP_COPY=step-shadow\n",
+		)
+		flow.ExpectFileContent("protected-final.txt", "ROOT_COPY=root-shadow\nfinal-protected\nresolved-matches-process\n")
+	})
+
+	t.Run("missing container env_file fails the step", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "container_env_file_missing.yaml")
+		result.ExpectNonZeroExitCode()
+		result.ExpectStderrContains("missing.env")
+	})
+
+	t.Run("duplicate predecessor outputs follow authored dependency order", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "duplicate_predecessor_outputs.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("duplicate-output-first-second.txt", "second\n")
+		flow.ExpectFileContent("duplicate-output-second-first.txt", "first\n")
+		flow.ExpectFileContent("duplicate-output-transitive.txt", "ancestor\n")
+		flow.ExpectFileContent("duplicate-output-visit-once.txt", "later\n")
+	})
+
+	t.Run("current step managed env precedence is explicit", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "current_step_managed_env.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent(
+			"current-step-managed-env.txt",
+			"STEP_NAME_COPY=managed\nSTEP_NAME_PROCESS=authored-step-name\nSTEP_STDOUT_COPY=${env.DAG_RUN_STEP_STDOUT_FILE}\nOUTPUT_FILE_COPY=${env.FLOW_OUTPUT_FILE}\nmanaged-stdout-file\nmanaged-output-file\n",
+		)
+		flow.ExpectFileContent("current-step-managed-output.txt", "published\n")
+	})
+
+	t.Run("secret env boundary distinguishes Flow and shell expansion", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.RunWithEnv(
+			[]string{"SPEC006_API_TOKEN=spec006-secret-value"},
+			"start",
+			"secret_env_boundary.yaml",
+		)
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent(
+			"secret-env-boundary.txt",
+			"PROCESS_ENV_BEFORE=spec006-secret-value\nUNQUALIFIED_AFTER_ASSIGN=shell-local\nNAMESPACED_INSERTION=spec006-secret-value\n",
+		)
+		flow.ExpectFileContent(
+			"secret-action-boundary.txt",
+			"UNQUALIFIED_ACTION=spec006-secret-value\nNAMESPACED_ACTION=spec006-secret-value\n",
+		)
+	})
+
+	t.Run("direct execution can use inherited process env fallback", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		buildArgWriter(t, flow)
+		result := flow.RunWithEnv(
+			[]string{"DIRECT_PROCESS_ONLY=from-process"},
+			"start",
+			"direct_execution_process_env_fallback.yaml",
+		)
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("direct-process-env.txt", "from-process\n")
+	})
+
+	t.Run("Flow credential settings never reach a step", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		buildArgWriter(t, flow)
+		buildEnvWriter(t, flow)
+		result := flow.RunWithEnv(
+			[]string{
+				// The built-in secret store's key, in the form Flow generates.
+				"FLOW_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+				"FLOW_SECRETS_VAULT_TOKEN=conformance-vault-token",
+				"FLOW_CONFORMANCE_SETTING=visible",
+			},
+			"start",
+			"flow_credentials_hidden.yaml",
+		)
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("flow-credentials-env.txt",
+			"FLOW_ENCRYPTION_KEY unset\nFLOW_SECRETS_VAULT_TOKEN unset\nFLOW_CONFORMANCE_SETTING=visible\nFROM_ROOT_ENV=${FLOW_SECRETS_VAULT_TOKEN}\nFROM_ENV_REF=${env.FLOW_ENCRYPTION_KEY}\n")
+		flow.ExpectFileContent("flow-credentials-expansion.txt",
+			"$FLOW_ENCRYPTION_KEY|${FLOW_SECRETS_VAULT_TOKEN}|visible\n")
+	})
+
+	t.Run("action inputs do not use inherited process env fallback", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.RunWithEnv(
+			[]string{"ACTION_PROCESS_ONLY=from-process"},
+			"start",
+			"action_with_no_process_env_fallback.yaml",
+		)
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("action-with-env.txt", "$ACTION_PROCESS_ONLY\n${ACTION_PROCESS_ONLY}\n")
+	})
+}
+
+// TestSubDAGPassedEnv covers the step-level pass_env field: which parent values
+// reach a child run, and which authored forms are rejected.
+func TestSubDAGPassedEnv(t *testing.T) {
+	t.Parallel()
+
+	t.Run("listed name does not fall back to the process environment", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.RunWithEnv(
+			[]string{"PASS_PROCESS_ONLY=from-process"},
+			"start",
+			"pass_env_no_process_env_fallback.yaml",
+		)
+		result.ExpectExitCode(0)
+		// An unresolved reference is preserved literally, so the literal is the
+		// signal that the name never resolved. A leak would write the value.
+		flow.ExpectFileContent("passed-env.txt", "[${PASS_PROCESS_ONLY}]")
+	})
+
+	t.Run("listed name resolves from the parent run environment", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "pass_env_named_run_value.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("passed-named.txt", "[from-parent]")
+	})
+
+	invalidCases := []struct {
+		name        string
+		file        string
+		stderrParts []string
+	}{
+		{
+			name:        "rejected on dag.enqueue",
+			file:        "invalid_pass_env_enqueue.yaml",
+			stderrParts: []string{"pass_env", "dag.enqueue"},
+		},
+		{
+			name:        "rejected for a reserved name",
+			file:        "invalid_pass_env_reserved_name.yaml",
+			stderrParts: []string{"pass_env", "_FLOW_INTERNAL_THING"},
+		},
+		{
+			name:        "rejected for a secret",
+			file:        "invalid_pass_env_secret.yaml",
+			stderrParts: []string{"pass_env", "API_TOKEN", "secret"},
+		},
+		{
+			name:        "rejected for a run-managed name",
+			file:        "invalid_pass_env_run_managed_name.yaml",
+			stderrParts: []string{"pass_env", "DAG_RUN_WORK_DIR"},
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", tc.file)
+			result.ExpectExitCode(1)
+			result.ExpectStdout("")
+			result.ExpectStderrContains(tc.stderrParts...)
+			result.ExpectStderrNotContains("Usage:")
+		})
+	}
+}
+
+// Compile outside the workflow timeout so direct execution tests measure
+// environment resolution independently of a cold Go build cache.
+func buildArgWriter(t *testing.T, flow *harness.Runner) {
+	t.Helper()
+	buildTestTool(t, flow, "write_arg")
+}
+
+// buildEnvWriter builds write_env, which reports variables from its own
+// process environment.
+func buildEnvWriter(t *testing.T, flow *harness.Runner) {
+	t.Helper()
+	buildTestTool(t, flow, "write_env")
+}
+
+func buildTestTool(t *testing.T, flow *harness.Runner, name string) {
+	t.Helper()
+
+	binary := name
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-o", flow.ProjectPath(binary), "testdata/"+name+".go")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "%s", output)
+}

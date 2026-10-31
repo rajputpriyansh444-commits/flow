@@ -1,0 +1,1214 @@
+package value
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// --- resolveForShell coverage ---
+
+func TestResolveForShell_FromScope(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("SCOPEVAR", "scopeval", EnvSourceDAGEnv)
+	r := &resolver{scope: scope}
+
+	val, ok := r.resolveForShell("SCOPEVAR")
+	require.True(t, ok)
+	require.Equal(t, "scopeval", val)
+}
+
+func TestResolveForShell_SkipsOSScope(t *testing.T) {
+	t.Setenv("OSVAR", "live_os_value")
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("OSVAR", "frozen_value", EnvSourceOS)
+	r := &resolver{scope: scope, expandOS: true}
+
+	val, ok := r.resolveForShell("OSVAR")
+	require.True(t, ok)
+	require.Equal(t, "live_os_value", val)
+}
+
+func TestResolveForShell_OSEnvFallback(t *testing.T) {
+	t.Setenv("TESTOSVAR", "osval")
+	r := &resolver{expandOS: true}
+
+	val, ok := r.resolveForShell("TESTOSVAR")
+	require.True(t, ok)
+	require.Equal(t, "osval", val)
+}
+
+func TestResolveForShell_NotFound(t *testing.T) {
+	r := &resolver{}
+	_, ok := r.resolveForShell("DEFINITELY_NOT_SET_EVER_12345")
+	assert.False(t, ok)
+}
+
+// --- resolveJSONSource coverage ---
+
+func TestResolveJSONSource_FromScope(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("JSONVAR", `{"a":1}`, EnvSourceDAGEnv)
+	r := &resolver{scope: scope}
+
+	val, ok := r.resolveJSONSource("JSONVAR")
+	require.True(t, ok)
+	require.Equal(t, `{"a":1}`, val)
+}
+
+func TestResolveJSONSource_FromScopeWithExpandOS(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("JSONVAR", `{"a":1}`, EnvSourceDAGEnv)
+	r := &resolver{scope: scope, expandOS: true}
+
+	val, ok := r.resolveJSONSource("JSONVAR")
+	require.True(t, ok)
+	require.Equal(t, `{"a":1}`, val)
+}
+
+func TestResolveJSONSource_FromOSEnv(t *testing.T) {
+	t.Setenv("JSONOSVAR", `{"b":2}`)
+	r := &resolver{expandOS: true}
+
+	val, ok := r.resolveJSONSource("JSONOSVAR")
+	require.True(t, ok)
+	require.Equal(t, `{"b":2}`, val)
+}
+
+func TestResolveJSONSource_NotFound(t *testing.T) {
+	r := &resolver{}
+	_, ok := r.resolveJSONSource("NOPE_NOT_HERE_12345")
+	assert.False(t, ok)
+}
+
+// --- resolver.resolve from scope ---
+
+func TestResolver_Resolve_FromScope(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("SCOPEVAR", "val", EnvSourceDAGEnv)
+	r := &resolver{scope: scope}
+
+	val, ok := r.resolve("SCOPEVAR")
+	require.True(t, ok)
+	require.Equal(t, "val", val)
+}
+
+func TestResolver_Resolve_SkipsOSSource(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("OSONLY", "frozen", EnvSourceOS)
+	r := &resolver{scope: scope}
+
+	_, ok := r.resolve("OSONLY")
+	assert.False(t, ok)
+}
+
+// --- resolveReference coverage ---
+
+func TestResolveReference_JSONFromScope(t *testing.T) {
+	scope := NewEnvScope(nil, false)
+	scope = scope.WithEntry("JDATA", `{"x":"y"}`, EnvSourceDAGEnv)
+	r := &resolver{scope: scope}
+
+	val, ok := r.resolveReference(context.Background(), "JDATA", ".x")
+	require.True(t, ok)
+	require.Equal(t, "y", val)
+}
+
+func TestResolveReference_JSONFromOSEnv(t *testing.T) {
+	t.Setenv("OSJSON", `{"a":"b"}`)
+	r := &resolver{expandOS: true}
+
+	val, ok := r.resolveReference(context.Background(), "OSJSON", ".a")
+	require.True(t, ok)
+	require.Equal(t, "b", val)
+}
+
+func TestResolveReference_NotFound(t *testing.T) {
+	r := &resolver{}
+	_, ok := r.resolveReference(context.Background(), "NOPE12345", ".x")
+	assert.False(t, ok)
+}
+
+func TestResolverForeachStructuredScopePrecedesShadowVariable(t *testing.T) {
+	t.Parallel()
+
+	shadow := NewEnvScope(nil, false).WithEntry("foreach", "shadow", EnvSourceStepEnv)
+	resolver := NewResolver(StaticScope{}, RuntimeScope{
+		Env: shadow,
+		Foreach: Values{
+			"episode": map[string]any{"請求番号": "INV-001"},
+		},
+	})
+
+	got, err := resolver.String(context.Background(), `${foreach.episode."請求番号"}|${foreach.episode["請求番号"]}|$foreach`, WorkflowField("run"))
+	require.NoError(t, err)
+	assert.Equal(t, "INV-001|INV-001|shadow", got)
+
+	jsonScope := NewEnvScope(nil, false).WithEntry("foreach", `{"episode":{"請求番号":"INV-002"}}`, EnvSourceStepEnv)
+	resolver = NewResolver(StaticScope{}, RuntimeScope{Env: jsonScope})
+	got, err = resolver.String(context.Background(), `${foreach.episode."請求番号"}|$foreach`, WorkflowField("run"))
+	require.NoError(t, err)
+	assert.Equal(t, `INV-002|{"episode":{"請求番号":"INV-002"}}`, got)
+}
+
+// A step named foreach takes precedence over item fields in every path form,
+// including when the item scope has a matching alias.
+func TestResolverForeachPreservesStepProperties(t *testing.T) {
+	t.Parallel()
+
+	for _, itemScope := range []Values{
+		{"episode": map[string]any{"請求番号": "INV-001"}},
+		{
+			"episode": map[string]any{"請求番号": "INV-001"},
+			"outputs": map[string]any{"value": "item-value"},
+			"stdout":  "item-stdout",
+		},
+	} {
+		outputs := `{"value":"step-value"}`
+		resolver := NewResolver(StaticScope{}, RuntimeScope{
+			Foreach: itemScope,
+			Steps: map[string]StepInfo{
+				"foreach": {Outputs: &outputs, Stdout: "step-stdout"},
+			},
+		})
+
+		got, err := resolver.String(context.Background(), `${foreach.outputs.value}|${foreach.outputs["value"]}|${foreach.stdout}|${foreach.episode["請求番号"]}`, WorkflowField("run"))
+		require.NoError(t, err)
+		assert.Equal(t, "step-value|step-value|step-stdout|INV-001", got)
+	}
+}
+
+func TestForeachStepQuoting(t *testing.T) {
+	t.Parallel()
+
+	outputs := `{"value":"a\"b\nc\\d"}`
+	resolver := NewResolver(StaticScope{}, RuntimeScope{
+		Foreach: Values{
+			"item":    "one",
+			"outputs": map[string]any{"value": "item-value"},
+		},
+		Steps: map[string]StepInfo{"foreach": {Outputs: &outputs}},
+	})
+	for _, ref := range []string{`${foreach.outputs.value}`, `${foreach.outputs."value"}`, `${foreach.outputs["value"]}`} {
+		t.Run(ref, func(t *testing.T) {
+			t.Run("json", func(t *testing.T) {
+				got, err := resolver.String(t.Context(), `{"result":"`+ref+`"}`, WorkflowField("foreach.collect"))
+				require.NoError(t, err)
+				var decoded map[string]string
+				require.NoError(t, json.Unmarshal([]byte(got), &decoded))
+				assert.Equal(t, "a\"b\nc\\d", decoded["result"])
+			})
+
+			for _, tc := range []struct {
+				shell string
+				want  string
+			}{
+				{shell: "sh", want: `echo "a\"b\nc\\d"`},
+				{shell: "pwsh", want: "echo \"a\"\"b`nc\\d\""},
+			} {
+				t.Run(tc.shell, func(t *testing.T) {
+					field := ShellCommandField("run", CommandContext{
+						Target:          CommandTargetLocal,
+						Shell:           []string{tc.shell},
+						ShellConfigured: true,
+					})
+					got, err := resolver.String(t.Context(), `echo "`+ref+`"`, field)
+					require.NoError(t, err)
+					assert.Equal(t, tc.want, got)
+				})
+			}
+		})
+	}
+}
+
+func TestResolverQuotedForeachValuesStayLiteral(t *testing.T) {
+	t.Parallel()
+
+	const item = `$SECRET ${SECRET} ${env.SECRET}`
+	resolver := NewResolver(StaticScope{}, RuntimeScope{
+		Env: NewEnvScope(nil, false).WithEntry("SECRET", "synthetic-secret", EnvSourceStepEnv),
+		Foreach: Values{
+			"episode": map[string]any{"請求番号": item},
+		},
+	})
+	for _, field := range []Field{WorkflowField("foreach.collect"), StepEnvField("CAPTURE")} {
+		got, err := resolver.String(context.Background(), `${foreach.episode."請求番号"}|${foreach.episode["請求番号"]}`, field)
+		require.NoError(t, err)
+		assert.Equal(t, item+"|"+item, got)
+	}
+
+	var notices ValueReferenceNoticeCollector
+	resolver = NewResolver(StaticScope{}, RuntimeScope{
+		Foreach: Values{"episode": map[string]any{"請求番号": item}},
+	}, WithValueReferenceNotices(&notices))
+	const malformed = `${foreach.episode[}`
+	got, err := resolver.String(context.Background(), malformed, WorkflowField("foreach.collect"))
+	require.NoError(t, err)
+	assert.Equal(t, malformed, got)
+	assert.Empty(t, notices.Notices())
+}
+
+func TestResolverForeachDollarEscapes(t *testing.T) {
+	t.Parallel()
+
+	var notices ValueReferenceNoticeCollector
+	resolver := NewResolver(StaticScope{}, RuntimeScope{
+		Foreach: Values{
+			"item":    "INV-001",
+			"episode": map[string]any{"請求番号": "INV-001"},
+		},
+	}, WithValueReferenceNotices(&notices))
+	command := CommandContext{Target: CommandTargetLocal, ShellConfigured: true, Shell: []string{"sh"}}
+	for _, ref := range []string{`${foreach.item}`, `${foreach.episode."請求番号"}`, `${foreach.episode["請求番号"]}`} {
+		for _, backslashes := range []int{1, 2, 3} {
+			input := strings.Repeat(`\`, backslashes) + ref
+			want := strings.Repeat(`\`, backslashes) + "INV-001"
+			if backslashes%2 == 1 {
+				want = strings.Repeat(`\`, backslashes-1) + ref
+			}
+			for _, field := range []Field{
+				WorkflowField("foreach.collect"), StepEnvField("CAPTURE"),
+				ShellCommandField("run", command), CommandScriptField("script", command),
+			} {
+				got, err := resolver.String(context.Background(), input, field)
+				require.NoError(t, err)
+				assert.Equal(t, want, got, "input: %s, field: %s", input, field.Path())
+			}
+
+			// A path field keeps every backslash as path text, so the item resolves.
+			got, err := resolver.String(context.Background(), input, StepArtifactOutputField("output"))
+			require.NoError(t, err)
+			assert.Equal(t, strings.Repeat(`\`, backslashes)+"INV-001", got, "input: %s, field: output", input)
+		}
+	}
+	assert.Empty(t, notices.Notices())
+}
+
+func TestForeachUnbraced(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewResolver(StaticScope{}, RuntimeScope{
+		Env:     NewEnvScope(nil, false).WithEntry("SECRET", "synthetic-secret", EnvSourceStepEnv),
+		Foreach: Values{"item": map[string]any{"value": "$SECRET"}},
+	})
+	command := CommandContext{Target: CommandTargetLocal, ShellConfigured: true, Shell: []string{"sh"}}
+	for _, ref := range []string{`$foreach.item.value`, `$foreach.item."value"`, `$foreach.item["value"]`} {
+		for _, field := range []Field{
+			WorkflowField("foreach.collect"), StepEnvField("CAPTURE"),
+			ShellCommandField("run", command), CommandScriptField("script", command),
+			StepArtifactOutputField("output"),
+		} {
+			got, err := resolver.String(t.Context(), ref, field)
+			require.NoError(t, err)
+			assert.Equal(t, ref, got, "field: %s", field.Path())
+		}
+	}
+}
+
+func TestForeachMissingField(t *testing.T) {
+	t.Parallel()
+
+	for _, ref := range []string{`${foreach.item.missing}`, `${foreach.item."missing"}`, `${foreach.item["missing"]}`, `${foreach.item.未設定}`} {
+		t.Run(ref, func(t *testing.T) {
+			var notices ValueReferenceNoticeCollector
+			resolver := NewResolver(StaticScope{}, RuntimeScope{
+				// A missing item field must not fall back to an environment value.
+				Env:     NewEnvScope(nil, false).WithEntry("foreach", `{"item":{"missing":"shadow","未設定":"shadow"}}`, EnvSourceStepEnv),
+				Foreach: Values{"item": map[string]any{"present": "value"}},
+			}, WithValueReferenceNotices(&notices))
+			got, err := resolver.String(t.Context(), ref, WorkflowField("foreach.collect"))
+			require.NoError(t, err)
+			assert.Equal(t, ref, got)
+			require.Len(t, notices.Notices(), 1)
+			assert.Equal(t, ValueReferenceReasonNamespaceUnavailable, notices.Notices()[0].Reason)
+		})
+	}
+}
+
+func TestForeachFieldValues(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{name: "integer", value: float64(1000000), want: "1000000"},
+		{name: "fraction", value: 0.0000042, want: "0.0000042"},
+		{name: "boolean", value: false, want: "false"},
+		{name: "object", value: map[string]any{"nested": "value"}, want: `{"nested":"value"}`},
+		{name: "array", value: []any{"one", "two"}, want: `["one","two"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var notices ValueReferenceNoticeCollector
+			resolver := NewResolver(StaticScope{}, RuntimeScope{
+				Foreach: Values{"item": map[string]any{"value": tc.value}},
+			}, WithValueReferenceNotices(&notices))
+			for _, ref := range []string{`${foreach.item.value}`, `${foreach.item."value"}`, `${foreach.item["value"]}`} {
+				got, err := resolver.String(t.Context(), ref, WorkflowField("foreach.collect"))
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, got, "reference: %s", ref)
+			}
+			assert.Empty(t, notices.Notices())
+		})
+	}
+}
+
+func TestForeachQuotedKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"請求番号", "column.name", "column name", `column["name"]`, ""} {
+		t.Run(key, func(t *testing.T) {
+			resolver := NewResolver(StaticScope{}, RuntimeScope{
+				Foreach: Values{"item": map[string]any{key: "value"}},
+			})
+			quoted, err := json.Marshal(key)
+			require.NoError(t, err)
+			for _, ref := range []string{"${foreach.item." + string(quoted) + "}", "${foreach.item[" + string(quoted) + "]}"} {
+				got, err := resolver.String(t.Context(), ref, WorkflowField("foreach.collect"))
+				require.NoError(t, err)
+				assert.Equal(t, "value", got, "reference: %s", ref)
+			}
+		})
+	}
+}
+
+// An unquoted item field may be named in any script, as workbook headers are.
+func TestForeachUnicodeFieldNames(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"請求番号", "リンク", "Straße", "café", "_行", "列2"} {
+		t.Run(key, func(t *testing.T) {
+			var notices ValueReferenceNoticeCollector
+			resolver := NewResolver(StaticScope{}, RuntimeScope{
+				Foreach: Values{"item": map[string]any{key: "value"}},
+			}, WithValueReferenceNotices(&notices))
+			got, err := resolver.String(t.Context(), "${foreach.item."+key+"}", WorkflowField("foreach.collect"))
+			require.NoError(t, err)
+			assert.Equal(t, "value", got)
+			assert.Empty(t, notices.Notices())
+		})
+	}
+}
+
+// --- ExpandOS resolver tests ---
+
+func TestResolveForShell_WithoutExpandOS(t *testing.T) {
+	t.Setenv("SHELL_TEST_VAR", "os_value")
+	r := &resolver{expandOS: false}
+
+	_, ok := r.resolveForShell("SHELL_TEST_VAR")
+	assert.False(t, ok, "should not find OS var when expandOS=false")
+}
+
+func TestResolveForShell_WithExpandOS(t *testing.T) {
+	t.Setenv("SHELL_TEST_VAR", "os_value")
+	r := &resolver{expandOS: true}
+
+	val, ok := r.resolveForShell("SHELL_TEST_VAR")
+	require.True(t, ok)
+	require.Equal(t, "os_value", val)
+}
+
+func TestResolveJSONSource_WithoutExpandOS(t *testing.T) {
+	t.Setenv("JSON_OS_VAR", `{"a":1}`)
+
+	// OS env should not be found
+	r := &resolver{expandOS: false}
+	_, ok := r.resolveJSONSource("JSON_OS_VAR")
+	assert.False(t, ok)
+
+	// OS-sourced scope entries should not be found
+	scope := NewEnvScope(nil, false).
+		WithEntry("SCOPE_OS", `{"b":2}`, EnvSourceOS)
+	r2 := &resolver{scope: scope, expandOS: false}
+	_, ok = r2.resolveJSONSource("SCOPE_OS")
+	assert.False(t, ok)
+
+	// Non-OS scope entries should still be found
+	scope2 := NewEnvScope(nil, false).
+		WithEntry("SCOPE_DAG", `{"c":3}`, EnvSourceDAGEnv)
+	r3 := &resolver{scope: scope2, expandOS: false}
+	val, ok := r3.resolveJSONSource("SCOPE_DAG")
+	require.True(t, ok)
+	require.Equal(t, `{"c":3}`, val)
+}
+
+// --- resolveForReplace coverage ---
+
+func TestResolveForReplace_ExplicitVarsAlwaysExpanded(t *testing.T) {
+	r := &resolver{
+		variables:      []map[string]string{{"FOO": "bar"}},
+		deferShellVars: true,
+	}
+	val, ok := r.resolveForReplace("FOO")
+	require.True(t, ok)
+	require.Equal(t, "bar", val)
+}
+
+func TestResolveForReplace_ExplicitVarsWithoutDefer(t *testing.T) {
+	r := &resolver{
+		variables:      []map[string]string{{"FOO": "bar"}},
+		deferShellVars: false,
+	}
+	val, ok := r.resolveForReplace("FOO")
+	require.True(t, ok)
+	require.Equal(t, "bar", val)
+}
+
+func TestResolveForReplace_ScopeVarDeferredWhenDeferTrue(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("PARAM", "value", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	_, ok := r.resolveForReplace("PARAM")
+	assert.False(t, ok, "scope var should be deferred when deferShellVars=true")
+}
+
+func TestResolveForReplace_ScopeVarExpandedWhenDeferFalse(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("PARAM", "value", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: false,
+	}
+	val, ok := r.resolveForReplace("PARAM")
+	require.True(t, ok)
+	require.Equal(t, "value", val)
+}
+
+func TestResolveForReplace_OSSourcedScopeSkippedEvenWithoutDefer(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("HOME", "/home/user", EnvSourceOS)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: false,
+	}
+	_, ok := r.resolveForReplace("HOME")
+	assert.False(t, ok, "OS-sourced scope should be skipped by lookupScopeNonOS")
+}
+
+func TestResolveForReplace_NotFoundReturnsEmpty(t *testing.T) {
+	r := &resolver{deferShellVars: true}
+	_, ok := r.resolveForReplace("NONEXISTENT")
+	assert.False(t, ok)
+}
+
+func TestResolveForReplace_ExplicitVarTakesPrecedenceOverScope(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("VAR", "scope_val", EnvSourceDAGEnv)
+	r := &resolver{
+		variables:      []map[string]string{{"VAR": "explicit_val"}},
+		scope:          scope,
+		deferShellVars: false,
+	}
+	val, ok := r.resolveForReplace("VAR")
+	require.True(t, ok)
+	require.Equal(t, "explicit_val", val)
+}
+
+// --- replaceVars with deferShellVars ---
+
+func TestReplaceVars_DeferShellVars_ExplicitVarExpanded(t *testing.T) {
+	r := &resolver{
+		variables:      []map[string]string{{"FOO": "bar"}},
+		deferShellVars: true,
+	}
+	got := r.replaceVars("echo $FOO")
+	require.Equal(t, "echo bar", got)
+}
+
+func TestReplaceVars_DeferShellVars_ScopeVarPreserved(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("TOPIC", "my-topic", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	got := r.replaceVars("echo $TOPIC")
+	require.Equal(t, "echo $TOPIC", got)
+}
+
+func TestReplaceVars_DeferShellVars_MixedExplicitAndScope(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("PARAM", "param_val", EnvSourceDAGEnv)
+	r := &resolver{
+		variables:      []map[string]string{{"EXPLICIT": "explicit_val"}},
+		scope:          scope,
+		deferShellVars: true,
+	}
+	got := r.replaceVars("$EXPLICIT and $PARAM")
+	require.Equal(t, "explicit_val and $PARAM", got)
+}
+
+func TestReplaceVars_DeferShellVars_BracedSyntaxScopePreserved(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("TOPIC", "my-topic", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	got := r.replaceVars("echo ${TOPIC}")
+	require.Equal(t, "echo ${TOPIC}", got)
+}
+
+func TestReplaceVars_DeferShellVars_BackticksInValuePreserved(t *testing.T) {
+	// Simulates the scenario where a scope var has backticks in its value.
+	// With deferShellVars=true, the var is NOT expanded, so the backticks
+	// never appear in the template output.
+	scope := NewEnvScope(nil, false).WithEntry("MSG", "say `hello`", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	got := r.replaceVars("echo $MSG")
+	require.Equal(t, "echo $MSG", got, "scope var with backticks should be deferred")
+}
+
+// --- deferShellVars with numeric (positional) vars ---
+
+func TestResolveForReplace_NumericVarNotDeferredEvenWithDefer(t *testing.T) {
+	scope := NewEnvScope(nil, false).WithEntry("1", "A", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	val, ok := r.resolveForReplace("1")
+	require.True(t, ok, "$1 should be expanded even with deferShellVars")
+	require.Equal(t, "A", val)
+}
+
+func TestReplaceVars_DeferShellVars_PositionalParamsExpanded(t *testing.T) {
+	scope := NewEnvScope(nil, false).
+		WithEntry("1", "A", EnvSourceDAGEnv).
+		WithEntry("2", "B", EnvSourceDAGEnv).
+		WithEntry("NAMED", "deferred", EnvSourceDAGEnv)
+	r := &resolver{
+		scope:          scope,
+		deferShellVars: true,
+	}
+	got := r.replaceVars("echo $1 $2 $NAMED")
+	require.Equal(t, "echo A B $NAMED", got)
+}
+
+func TestIsNumericVar(t *testing.T) {
+	assert.True(t, isNumericVar("1"))
+	assert.True(t, isNumericVar("42"))
+	assert.True(t, isNumericVar("0"))
+	assert.False(t, isNumericVar(""))
+	assert.False(t, isNumericVar("a"))
+	assert.False(t, isNumericVar("1a"))
+	assert.False(t, isNumericVar("FOO"))
+}
+
+// --- expandReferences unaffected by deferShellVars ---
+
+func TestExpandReferences_StillWorksWithDeferShellVars(t *testing.T) {
+	ctx := context.Background()
+	r := &resolver{
+		stepMap: map[string]StepInfo{
+			"step1": {Stdout: "/tmp/out.txt"},
+		},
+		deferShellVars: true,
+	}
+	got := r.expandReferences(ctx, "cat ${step1.stdout}")
+	require.Equal(t, "cat /tmp/out.txt", got)
+}
+
+func TestExpandReferences_JSONPathWithDeferShellVars(t *testing.T) {
+	ctx := context.Background()
+	r := &resolver{
+		variables:      []map[string]string{{"DATA": `{"key":"val"}`}},
+		deferShellVars: true,
+	}
+	got := r.expandReferences(ctx, "result: ${DATA.key}")
+	require.Equal(t, "result: val", got)
+}
+
+// --- expandReferences short submatch ---
+
+func TestExpandReferences_ShortSubmatch(t *testing.T) {
+	ctx := context.Background()
+	dataMap := map[string]string{
+		"DATA": `{"key":"val"}`,
+	}
+	result := expandReferences(ctx, "$DATA.key", dataMap)
+	require.Equal(t, "val", result)
+}
+
+// --- replaceVars ---
+
+func TestReplaceVars(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		vars     map[string]string
+		want     string
+	}{
+		{
+			name:     "BasicSubstitution",
+			template: "${FOO}",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "BAR",
+		},
+		{
+			name:     "ShortSyntax",
+			template: "$FOO",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "BAR",
+		},
+		{
+			name:     "NoSubstitution",
+			template: "$FOO_",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "$FOO_",
+		},
+		{
+			name:     "InMiddleOfString",
+			template: "prefix $FOO suffix",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "prefix BAR suffix",
+		},
+		{
+			name:     "InMiddleOfStringAndNoSubstitution",
+			template: "prefix $FOO1 suffix",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "prefix $FOO1 suffix",
+		},
+		{
+			name:     "MissingVar",
+			template: "${MISSING}",
+			vars:     map[string]string{"FOO": "BAR"},
+			want:     "${MISSING}",
+		},
+		{
+			name:     "MultipleVars",
+			template: "$FOO ${BAR} $BAZ",
+			vars: map[string]string{
+				"FOO": "1",
+				"BAR": "2",
+				"BAZ": "3",
+			},
+			want: "1 2 3",
+		},
+		{
+			name:     "NestedVarsNotSupported",
+			template: "${FOO${BAR}}",
+			vars:     map[string]string{"FOO": "1", "BAR": "2"},
+			want:     "${FOO${BAR}}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &resolver{variables: []map[string]string{tt.vars}}
+			got := r.replaceVars(tt.template)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestReplaceVars_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		vars     map[string]string
+		want     string
+	}{
+		{
+			name:     "SingleQuotesPreserved",
+			template: "'$FOO'",
+			vars:     map[string]string{"FOO": "bar"},
+			want:     "'$FOO'",
+		},
+		{
+			name:     "SingleQuotesPreservedWithBraces",
+			template: "'${FOO}'",
+			vars:     map[string]string{"FOO": "bar"},
+			want:     "'${FOO}'",
+		},
+		{
+			name:     "EmptyVariableName",
+			template: "${}",
+			vars:     map[string]string{"": "value"},
+			want:     "${}",
+		},
+		{
+			name:     "UnderscoreInVarName",
+			template: "${FOO_BAR}",
+			vars:     map[string]string{"FOO_BAR": "value"},
+			want:     "value",
+		},
+		{
+			name:     "NumberInVarName",
+			template: "${FOO123}",
+			vars:     map[string]string{"FOO123": "value"},
+			want:     "value",
+		},
+		{
+			name:     "VarFollowedBySingleQuote",
+			template: "${FOO}'",
+			vars:     map[string]string{"FOO": "bar"},
+			want:     "bar'",
+		},
+		{
+			name:     "SimpleVarFollowedBySingleQuote",
+			template: "$FOO'",
+			vars:     map[string]string{"FOO": "bar"},
+			want:     "bar'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &resolver{variables: []map[string]string{tt.vars}}
+			got := r.replaceVars(tt.template)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestReplaceVarsWithScope(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		scope    *EnvScope
+		want     string
+	}{
+		{
+			name:     "UserDefinedVarExpanded",
+			template: "Hello ${NAME}",
+			scope:    NewEnvScope(nil, false).WithEntry("NAME", "World", EnvSourceDAGEnv),
+			want:     "Hello World",
+		},
+		{
+			name:     "OSVarNotExpanded",
+			template: "Path is $PATH",
+			scope:    NewEnvScope(nil, true),
+			want:     "Path is $PATH",
+		},
+		{
+			name:     "JSONPathSkipped",
+			template: "${step.stdout}",
+			scope:    NewEnvScope(nil, false).WithEntry("step", "ignored", EnvSourceDAGEnv),
+			want:     "${step.stdout}",
+		},
+		{
+			name:     "SingleQuotedSkipped",
+			template: "'${NAME}' stays",
+			scope:    NewEnvScope(nil, false).WithEntry("NAME", "World", EnvSourceDAGEnv),
+			want:     "'${NAME}' stays",
+		},
+		{
+			name:     "MixedExpansion",
+			template: "User ${USER} env $HOME",
+			scope:    NewEnvScope(nil, true).WithEntry("USER", "alice", EnvSourceDAGEnv),
+			want:     "User alice env $HOME",
+		},
+		{
+			name:     "StepEnvExpanded",
+			template: "${STEP_VAR}",
+			scope:    NewEnvScope(nil, false).WithEntry("STEP_VAR", "step_value", EnvSourceStepEnv),
+			want:     "step_value",
+		},
+		{
+			name:     "SecretExpanded",
+			template: "key=${SECRET}",
+			scope:    NewEnvScope(nil, false).WithEntry("SECRET", "s3cr3t", EnvSourceSecret),
+			want:     "key=s3cr3t",
+		},
+		{
+			name:     "NilScope",
+			template: "${VAR}",
+			scope:    nil,
+			want:     "${VAR}",
+		},
+		{
+			name:     "MissingVar",
+			template: "${MISSING}",
+			scope:    NewEnvScope(nil, false).WithEntry("OTHER", "value", EnvSourceDAGEnv),
+			want:     "${MISSING}",
+		},
+		{
+			name:     "MultipleVars",
+			template: "${A} ${B} ${C}",
+			scope: NewEnvScope(nil, false).
+				WithEntry("A", "1", EnvSourceDAGEnv).
+				WithEntry("B", "2", EnvSourceStepEnv).
+				WithEntry("C", "3", EnvSourceSecret),
+			want: "1 2 3",
+		},
+		{
+			name:     "ShortAndBracedSyntax",
+			template: "$FOO and ${BAR}",
+			scope: NewEnvScope(nil, false).
+				WithEntry("FOO", "foo", EnvSourceDAGEnv).
+				WithEntry("BAR", "bar", EnvSourceDAGEnv),
+			want: "foo and bar",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &resolver{scope: tt.scope}
+			got := r.replaceVars(tt.template)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// --- expandReferences ---
+
+func TestExpandReferences(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		dataMap map[string]string
+		want    string
+	}{
+		{
+			name:  "BasicReplacementWithCurlyBraces",
+			input: "Hello: ${FOO.bar}",
+			dataMap: map[string]string{
+				"FOO": `{"bar": "World"}`,
+			},
+			want: "Hello: World",
+		},
+		{
+			name:  "BasicReplacementWithSingleDollarSign",
+			input: "Output => $FOO.value",
+			dataMap: map[string]string{
+				"FOO": `{"value": "SingleDollarWorks"}`,
+			},
+			want: "Output => SingleDollarWorks",
+		},
+		{
+			name:  "MissingKeyInDataMap",
+			input: "Hello: ${BAR.xyz}",
+			dataMap: map[string]string{
+				"FOO": `{"bar":"zzz"}`,
+			},
+			want: "Hello: ${BAR.xyz}",
+		},
+		{
+			name:  "InvalidJSONInDataMap",
+			input: "Test => ${FOO.bar}",
+			dataMap: map[string]string{
+				"FOO": `{"bar":`,
+			},
+			want: "Test => ${FOO.bar}",
+		},
+		{
+			name:  "NestedSubPathExtraction",
+			input: "Deep => ${FOO.level1.level2}",
+			dataMap: map[string]string{
+				"FOO": `{"level1": {"level2":"DeepValue"}}`,
+			},
+			want: "Deep => DeepValue",
+		},
+		{
+			name:  "NonExistentSubPathInValidJSON",
+			input: "Data => ${FOO.bar.baz}",
+			dataMap: map[string]string{
+				"FOO": `{"bar":"NotAnObject"}`,
+			},
+			want: "Data => ${FOO.bar.baz}",
+		},
+		{
+			name:  "MultiplePlaceholdersIncludingSingleDollarForm",
+			input: "Multi: ${FOO.one}, $FOO.two , and ${FOO.three}",
+			dataMap: map[string]string{
+				"FOO": `{
+								"one": "1",
+								"two": "2",
+								"three": "3"
+						}`,
+			},
+			want: "Multi: 1, 2 , and 3",
+		},
+		{
+			name:    "LookupFromEnvironmentNotExpanded",
+			input:   "${TEST_JSON_VAR.bar}",
+			dataMap: map[string]string{},
+			want:    "${TEST_JSON_VAR.bar}",
+		},
+	}
+
+	t.Setenv("TEST_JSON_VAR", `{"bar": "World"}`)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			got := expandReferences(ctx, tt.input, tt.dataMap)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestExpandReferencesWithSteps(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		dataMap map[string]string
+		stepMap map[string]StepInfo
+		want    string
+	}{
+		{
+			name:    "BasicStepIDStdoutReference",
+			input:   "Log file is at ${download.stdout}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"download": {
+					Stdout:   "/tmp/logs/download.out",
+					Stderr:   "/tmp/logs/download.err",
+					ExitCode: "0",
+				},
+			},
+			want: "Log file is at /tmp/logs/download.out",
+		},
+		{
+			name:    "StepIDStderrReference",
+			input:   "Check errors at ${build.stderr}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"build": {
+					Stdout:   "/tmp/logs/build.out",
+					Stderr:   "/tmp/logs/build.err",
+					ExitCode: "1",
+				},
+			},
+			want: "Check errors at /tmp/logs/build.err",
+		},
+		{
+			name:    "StepIDExitCodeReference",
+			input:   "Build exited with code ${build.exit_code}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"build": {
+					Stdout:   "/tmp/logs/build.out",
+					Stderr:   "/tmp/logs/build.err",
+					ExitCode: "1",
+				},
+			},
+			want: "Build exited with code 1",
+		},
+		{
+			name:    "MultipleStepReferences",
+			input:   "Download log: ${download.stdout}, Build errors: ${build.stderr}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"download": {
+					Stdout: "/tmp/logs/download.out",
+				},
+				"build": {
+					Stderr: "/tmp/logs/build.err",
+				},
+			},
+			want: "Download log: /tmp/logs/download.out, Build errors: /tmp/logs/build.err",
+		},
+		{
+			name:    "UnknownStepIDLeavesAsIs",
+			input:   "Unknown step: ${unknown.stdout}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"known": {
+					Stdout: "/tmp/logs/known.out",
+				},
+			},
+			want: "Unknown step: ${unknown.stdout}",
+		},
+		{
+			name:    "UnknownPropertyLeavesAsIs",
+			input:   "Unknown prop: ${download.unknown}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"download": {
+					Stdout: "/tmp/logs/download.out",
+				},
+			},
+			want: "Unknown prop: ${download.unknown}",
+		},
+		{
+			name:  "StepIDPrecedenceOverVariable",
+			input: "Value: ${download.stdout}",
+			dataMap: map[string]string{
+				"download": `{"stdout": "from-variable"}`,
+			},
+			stepMap: map[string]StepInfo{
+				"download": {
+					Stdout: "/tmp/logs/download.out",
+				},
+			},
+			want: "Value: /tmp/logs/download.out",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			got := expandReferencesWithSteps(ctx, tt.input, tt.dataMap, tt.stepMap)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestExpandReferencesWithSteps_Extended(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		dataMap map[string]string
+		stepMap map[string]StepInfo
+		want    string
+	}{
+		{
+			name:    "StepStdoutReference",
+			input:   "The output is at ${step1.stdout}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "/tmp/step1.out",
+				},
+			},
+			want: "The output is at /tmp/step1.out",
+		},
+		{
+			name:    "StepStderrReference",
+			input:   "Errors at ${step1.stderr}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stderr: "/tmp/step1.err",
+				},
+			},
+			want: "Errors at /tmp/step1.err",
+		},
+		{
+			name:    "StepExitCodeReference",
+			input:   "Exit code: ${step1.exit_code}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					ExitCode: "0",
+				},
+			},
+			want: "Exit code: 0",
+		},
+		{
+			name:    "MissingStepReference",
+			input:   "Missing: ${missing_step.stdout}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "/tmp/step1.out",
+				},
+			},
+			want: "Missing: ${missing_step.stdout}",
+		},
+		{
+			name:    "EmptyStepProperty",
+			input:   "Empty: ${step1.stdout}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "",
+				},
+			},
+			want: "Empty: ${step1.stdout}",
+		},
+		{
+			name:    "NilStepMap",
+			input:   "No steps: ${step1.stdout}",
+			dataMap: map[string]string{},
+			stepMap: nil,
+			want:    "No steps: ${step1.stdout}",
+		},
+		{
+			name:  "RegularVariableTakesPrecedence",
+			input: "Value: ${step1.field}",
+			dataMap: map[string]string{
+				"step1": `{"field": "from_var"}`,
+			},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "/tmp/step1.out",
+				},
+			},
+			want: "Value: from_var",
+		},
+		{
+			name:    "DollarSignWithoutBraces",
+			input:   "Path: $step1.stdout",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "/tmp/out",
+				},
+			},
+			want: "Path: /tmp/out",
+		},
+		{
+			name:    "MultipleStepReferences",
+			input:   "Out: ${step1.stdout}, Err: ${step1.stderr}, Code: ${step1.exit_code}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout:   "/tmp/out",
+					Stderr:   "/tmp/err",
+					ExitCode: "1",
+				},
+			},
+			want: "Out: /tmp/out, Err: /tmp/err, Code: 1",
+		},
+		{
+			name:    "StepStdoutReferenceWithSlice",
+			input:   "Slice: ${step1.stdout:0:4}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "abcdef",
+				},
+			},
+			want: "Slice: abcd",
+		},
+		{
+			name:    "StepStdoutReferenceWithOffsetOnly",
+			input:   "Tail: ${step1.stdout:3}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "abcdef",
+				},
+			},
+			want: "Tail: def",
+		},
+		{
+			name:    "StepStdoutReferenceWithSliceBeyondLength",
+			input:   "Beyond: ${step1.stdout:10:3}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "abc",
+				},
+			},
+			want: "Beyond: ",
+		},
+		{
+			name:    "StepStdoutReferenceWithInvalidSlice",
+			input:   "Invalid: ${step1.stdout:-1:2}",
+			dataMap: map[string]string{},
+			stepMap: map[string]StepInfo{
+				"step1": {
+					Stdout: "abcdef",
+				},
+			},
+			want: "Invalid: ${step1.stdout:-1:2}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			got := expandReferencesWithSteps(ctx, tt.input, tt.dataMap, tt.stepMap)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}

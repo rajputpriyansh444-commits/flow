@@ -1,0 +1,177 @@
+package persis
+
+import (
+	"context"
+	"maps"
+	"path/filepath"
+	"sync"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/fileutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger/tag"
+	"github.com/rajputpriyansh444-commits/flow/internal/dagrun"
+	"github.com/rajputpriyansh444-commits/flow/internal/eventstore"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/spec"
+)
+
+type eventingAttempt struct {
+	dagrun.Attempt
+
+	mu  sync.Mutex
+	dag *ir.DAG
+	// ephemeral suppresses every event of the run.
+	ephemeral            bool
+	lastEmittedEventType eventstore.EventType
+}
+
+func newEventingAttempt(attempt dagrun.Attempt, dag *ir.DAG, ephemeral bool) dagrun.Attempt {
+	if attempt == nil {
+		return nil
+	}
+	return &eventingAttempt{Attempt: attempt, dag: dag, ephemeral: ephemeral}
+}
+
+func (a *eventingAttempt) Open(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.dag != nil {
+		snapshot, err := spec.PrepareDAGSnapshot(a.dag)
+		if err != nil {
+			return err
+		}
+		a.Attempt.SetDAG(snapshot)
+	}
+	if err := a.Attempt.Open(ctx); err != nil {
+		return err
+	}
+	a.lastEmittedEventType = ""
+	if _, _, ok := eventstore.FromContext(ctx); ok && !a.ephemeral {
+		if status, err := a.ReadStatus(ctx); err == nil && status != nil {
+			a.lastEmittedEventType, _ = eventstore.PersistedDAGRunEventTypeForStatus(status.Status)
+		}
+	}
+	return nil
+}
+
+func (a *eventingAttempt) Write(ctx context.Context, status ir.DAGRunStatus) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err := a.Attempt.Write(ctx, status); err != nil {
+		return err
+	}
+	if a.ephemeral || status.Ephemeral {
+		return nil
+	}
+	if _, _, ok := eventstore.FromContext(ctx); !ok {
+		return nil
+	}
+	a.lastEmittedEventType = emitStatusEvent(
+		ctx,
+		a.lastEmittedEventType,
+		&status,
+		a.eventData(ctx),
+	)
+	return nil
+}
+
+func (a *eventingAttempt) Close(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Attempt.Close(ctx)
+}
+
+// Dir returns the directory of the wrapped attempt, or "" when it has none.
+func (a *eventingAttempt) Dir() string {
+	if p, ok := a.Attempt.(interface{ Dir() string }); ok {
+		return p.Dir()
+	}
+	return ""
+}
+
+func (a *eventingAttempt) SetDAG(dag *ir.DAG) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.dag = dag
+	a.Attempt.SetDAG(dag)
+}
+
+func (a *eventingAttempt) eventData(ctx context.Context) map[string]any {
+	if a.dag == nil {
+		a.dag, _ = a.ReadDAG(ctx)
+	}
+	return dagRunEventData(a.dag)
+}
+
+func (r *DAGRunRepository) emitStatusEventAfterSwap(
+	ctx context.Context,
+	root ir.DAGRunRef,
+	dagRun ir.DAGRunRef,
+	previousStatus ir.Status,
+	status *ir.DAGRunStatus,
+) {
+	if _, _, ok := eventstore.FromContext(ctx); !ok {
+		return
+	}
+	previousEventType, _ := eventstore.PersistedDAGRunEventTypeForStatus(previousStatus)
+	emitStatusEvent(ctx, previousEventType, status, r.eventDataForDAGRun(ctx, root, dagRun))
+}
+
+func (r *DAGRunRepository) eventDataForDAGRun(ctx context.Context, root, dagRun ir.DAGRunRef) map[string]any {
+	var (
+		attempt dagrun.Attempt
+		err     error
+	)
+	if root.ID != dagRun.ID || root.Name != dagRun.Name {
+		attempt, err = r.FindSubAttempt(ctx, root, dagRun.ID)
+	} else {
+		attempt, err = r.FindAttempt(ctx, dagRun)
+	}
+	if err != nil {
+		return nil
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil {
+		return nil
+	}
+	return dagRunEventData(dag)
+}
+
+func emitStatusEvent(
+	ctx context.Context,
+	previous eventstore.EventType,
+	status *ir.DAGRunStatus,
+	data map[string]any,
+) eventstore.EventType {
+	next, _, err := eventstore.EmitPersistedStatusTransitionFromContext(ctx, previous, status, data)
+	if err != nil {
+		logger.Warn(ctx, "Failed to emit DAG-run event", tag.Error(err))
+		return previous
+	}
+	return next
+}
+
+func dagRunEventData(dag *ir.DAG) map[string]any {
+	if dag == nil {
+		return nil
+	}
+	fileName := dag.FileName()
+	if fileName == "" && dag.SourceFile != "" {
+		fileName = fileutil.TrimYAMLFileExtension(filepath.Base(dag.SourceFile))
+	}
+	if fileName == "" && len(dag.WorkerSelector) == 0 {
+		return nil
+	}
+	data := make(map[string]any, 2)
+	if fileName != "" {
+		data[eventstore.DAGFileNameDataKey] = fileName
+	}
+	if len(dag.WorkerSelector) > 0 {
+		// A consumer that opens worker capacity on demand reads which labels a
+		// waiting run needs from here.
+		data[eventstore.WorkerSelectorDataKey] = maps.Clone(dag.WorkerSelector)
+	}
+	return data
+}

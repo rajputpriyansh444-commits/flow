@@ -1,0 +1,237 @@
+package opencodehost
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestManagedEnvironment(t *testing.T) {
+	env, err := managedEnvironment([]string{
+		"PATH=/bin", "HOME=/home/flow", "OPENAI_API_KEY=secret", "DATABASE_URL=secret",
+		"FLOW_AUTH_BASIC_PASSWORD=secret", "OPENCODE_CONFIG_CONTENT={}", envPassword + "=secret",
+	}, []string{"OPENAI_API_KEY"})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		"PATH=/bin", "HOME=/home/flow", "OPENAI_API_KEY=secret", "OPENCODE_CONFIG_CONTENT={}",
+	}, env)
+
+	_, err = managedEnvironment(nil, []string{"OPENCODE_SERVER_PASSWORD"})
+	require.Error(t, err)
+}
+
+func TestWithManagedConfigPreservesExistingKeysAndDisablesSharing(t *testing.T) {
+	env, err := withManagedConfig([]string{`OPENCODE_CONFIG_CONTENT={"mcp":{"docs":{"type":"local"}},"share":"auto"}`})
+	require.NoError(t, err)
+	require.Len(t, env, 1)
+	_, content, ok := strings.Cut(env[0], "=")
+	require.True(t, ok)
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal([]byte(content), &settings))
+	assert.Equal(t, "disabled", settings["share"])
+	assert.Contains(t, settings, "mcp")
+}
+
+func TestWithManagedConfigRejectsNull(t *testing.T) {
+	_, err := withManagedConfig([]string{"OPENCODE_CONFIG_CONTENT=null"})
+	require.EqualError(t, err, "OPENCODE_CONFIG_CONTENT must contain a JSON object")
+}
+
+func TestEnsureDoesNotReplaceRunningUnhealthyHost(t *testing.T) {
+	host := New(context.Background(), config.OpenCodeConfig{})
+	host.cmd = &exec.Cmd{}
+	host.waitCh = make(chan error, 1)
+	host.config = Config{URL: "http://127.0.0.1:1", Username: "opencode", Password: "secret", InstanceID: "instance"}
+	host.healthCheck = func(context.Context, Config) (string, error) { return "", errors.New("probe failed") }
+
+	_, err := host.Ensure()
+	require.Error(t, err)
+	assert.NotNil(t, host.cmd)
+	assert.Equal(t, "instance", host.config.InstanceID)
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	host := New(context.Background(), config.OpenCodeConfig{})
+	host.cmd = &exec.Cmd{}
+	host.waitCh = make(chan error, 1)
+	host.waitCh <- context.Canceled
+
+	require.NoError(t, host.Close(t.Context()))
+	require.NoError(t, host.Close(t.Context()))
+}
+
+// Startup output can contain lines longer than bufio.Scanner's default 64 KiB
+// limit; endpoint discovery must still find the listening line.
+func TestScanEndpointLongLines(t *testing.T) {
+	t.Parallel()
+
+	ready := make(chan string, 1)
+	stdout := strings.Repeat("x", 200*1024) + "\nopencode server listening on http://127.0.0.1:4096\n"
+	scanEndpoint(strings.NewReader(stdout), ready)
+	require.Len(t, ready, 1, "listening endpoint was not found")
+	require.Equal(t, "http://127.0.0.1:4096", <-ready)
+}
+
+func TestScanEndpointV2(t *testing.T) {
+	t.Parallel()
+
+	ready := make(chan string, 1)
+	scanEndpoint(strings.NewReader("server listening on http://127.0.0.1:4096\n"), ready)
+	require.Len(t, ready, 1, "OpenCode v2 listening endpoint was not found")
+	require.Equal(t, "http://127.0.0.1:4096", <-ready)
+}
+
+func TestValidateRequiresManagedCredentials(t *testing.T) {
+	t.Parallel()
+
+	err := validate(Config{URL: "http://127.0.0.1:4096", Password: "secret", InstanceID: "instance"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credentials")
+}
+
+func TestStartupErrorIncludesProcessDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	err := startupError("OpenCode server exited before startup", errors.New("exit status 1"), "provider configuration failed\n")
+	assert.Contains(t, err.Error(), "exit status 1")
+	assert.Contains(t, err.Error(), "provider configuration failed")
+}
+
+func TestSanitizeErrorKeepsValidUTF8(t *testing.T) {
+	t.Parallel()
+
+	// The byte cap can land inside a multibyte rune; the sanitized message
+	// travels through an env var into step errors, so it must stay valid.
+	err := errors.New(strings.Repeat("a", 1023) + "界")
+	message := sanitizeError(err)
+	assert.LessOrEqual(t, len(message), 1024)
+	assert.True(t, utf8.ValidString(message))
+}
+
+func TestStartupErrorKeepsValidUTF8(t *testing.T) {
+	t.Parallel()
+
+	// The stderr tail cut can leave a partial rune at the start and raw
+	// process output can carry invalid bytes; the error must stay valid.
+	tail := strings.Repeat("x", 3) + "界" + strings.Repeat("y", 1023)
+	require.Greater(t, len(tail), 1024)
+	err := startupError("OpenCode server exited before startup", nil, tail)
+	assert.True(t, utf8.ValidString(err.Error()))
+
+	err = startupError("OpenCode server exited before startup", nil, "oops\xff\xfe")
+	assert.True(t, utf8.ValidString(err.Error()))
+}
+
+func TestStartupErrorCapsExpandedUTF8Tail(t *testing.T) {
+	t.Parallel()
+
+	// Invalid bytes expand to multi-byte replacement runes during
+	// normalization, so the cap must apply after it.
+	err := startupError("OpenCode server exited before startup", nil, strings.Repeat("\xff", 1024))
+
+	const prefix = "OpenCode server exited before startup; stderr: "
+	require.True(t, strings.HasPrefix(err.Error(), prefix))
+	stderr := strings.TrimPrefix(err.Error(), prefix)
+	assert.LessOrEqual(t, len(stderr), 1024)
+	assert.True(t, utf8.ValidString(stderr))
+}
+
+func TestSessionAvailableUsesPersistedProviderState(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/workspace", r.URL.Query().Get("directory"))
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": "session-1", "directory": "/workspace"})
+	}))
+	t.Cleanup(server.Close)
+
+	available, err := SessionAvailable(t.Context(), Config{
+		URL: server.URL, Username: "opencode", Password: "secret", InstanceID: "new-host",
+	}, "/workspace", "session-1")
+
+	require.NoError(t, err)
+	assert.True(t, available)
+}
+
+func TestModeTreatsSharingAsCLIOnly(t *testing.T) {
+	mode, err := Mode(map[string]any{"provider": "opencode", "share": true})
+	require.NoError(t, err)
+	assert.False(t, mode.Managed)
+	assert.False(t, mode.Required)
+	assert.Contains(t, mode.Reason, "CLI integration")
+
+	mode, err = Mode(map[string]any{"provider": "opencode", "managed": true, "share": true})
+	require.Error(t, err)
+	assert.True(t, mode.Required)
+}
+
+func TestRealOpenCodeCapabilities(t *testing.T) {
+	executable := os.Getenv("FLOW_TEST_OPENCODE_EXECUTABLE")
+	if executable == "" {
+		t.Skip("FLOW_TEST_OPENCODE_EXECUTABLE is not set")
+	}
+	host := New(context.Background(), config.OpenCodeConfig{Executable: executable})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, host.Close(ctx))
+	})
+
+	hostConfig, err := host.Ensure()
+	require.NoError(t, err)
+	require.NotEmpty(t, hostConfig.InstanceID)
+	if expected := os.Getenv("FLOW_TEST_OPENCODE_VERSION"); expected != "" {
+		require.Equal(t, expected, hostConfig.Version)
+	}
+}
+
+func TestHealthV2(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/info" {
+			_, _ = w.Write([]byte(`{"version":"2.1.4","pid":123,"urls":[],"paths":{"tmp":"/tmp"}}`))
+			return
+		}
+		_, _ = w.Write([]byte("<html>OpenCode</html>"))
+	}))
+	defer server.Close()
+	host := New(t.Context(), config.OpenCodeConfig{})
+	version, err := host.probeHealth(t.Context(), Config{URL: server.URL})
+	require.NoError(t, err)
+	require.Equal(t, "2.1.4", version)
+}
+
+func TestManagedPasswordV2(t *testing.T) {
+	env, err := managedEnvironment([]string{"OPENCODE_PASSWORD=inherited", "PATH=/bin"}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"PATH=/bin"}, env)
+	_, err = managedEnvironment(nil, []string{"OPENCODE_PASSWORD"})
+	require.Error(t, err)
+}
+
+func TestSharingV2(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		disabled bool
+	}{
+		{`[{"type":"document","info":{"share":"auto"}},{"type":"directory","path":"/tmp"},{"type":"document","info":{"share":"disabled"}}]`, true},
+		{`[{"type":"document","info":{"share":"disabled"}},{"type":"document","info":{"share":"auto"}}]`, false},
+		{`[]`, false},
+	} {
+		var value any
+		require.NoError(t, json.Unmarshal([]byte(tc.input), &value))
+		require.Equal(t, tc.disabled, SharingDisabled(value))
+	}
+}

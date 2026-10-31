@@ -1,0 +1,584 @@
+package notification
+
+import (
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/mailer/oauthconfig"
+	"github.com/rajputpriyansh444-commits/flow/internal/eventstore"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNormalizeValidatesTargetsAndEvents(t *testing.T) {
+	t.Parallel()
+
+	settings := &Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events: []eventstore.EventType{
+			eventstore.TypeDAGRunFailed,
+			eventstore.TypeDAGRunFailed,
+		},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Events: []eventstore.EventType{
+				eventstore.TypeDAGRunFailed,
+				eventstore.TypeDAGRunFailed,
+			},
+			Webhook: &WebhookTarget{
+				URL: "https://example.com/webhook",
+			},
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+
+	normalized, err := Normalize(settings, "tester")
+	require.NoError(t, err)
+	require.Len(t, normalized.Events, 1)
+	require.Len(t, normalized.Targets, 1)
+	assert.NotEmpty(t, normalized.ID)
+	assert.NotEmpty(t, normalized.Targets[0].ID)
+	assert.Equal(t, []eventstore.EventType{eventstore.TypeDAGRunFailed}, normalized.Targets[0].Events)
+	assert.True(t, IsTargetEventEnabled(normalized, normalized.Targets[0], eventstore.TypeDAGRunFailed))
+	assert.False(t, IsTargetEventEnabled(normalized, normalized.Targets[0], eventstore.TypeDAGRunWaiting))
+}
+
+func TestNormalizeRejectsEmptyEvents(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{URL: "https://example.com/webhook"},
+		}},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+}
+
+func TestPreserveSecrets(t *testing.T) {
+	t.Parallel()
+
+	next := &Settings{Targets: []Target{{
+		ID:      "webhook-1",
+		Type:    ProviderWebhook,
+		Webhook: &WebhookTarget{},
+	}}}
+	existing := &Settings{Targets: []Target{{
+		ID:   "webhook-1",
+		Type: ProviderWebhook,
+		Webhook: &WebhookTarget{
+			URL:        "https://example.com/webhook",
+			Headers:    map[string]string{"Authorization": "Bearer old"},
+			HMACSecret: "old-secret",
+		},
+	}}}
+
+	PreserveSecrets(next, existing)
+	assert.Equal(t, "https://example.com/webhook", next.Targets[0].Webhook.URL)
+	assert.Equal(t, "old-secret", next.Targets[0].Webhook.HMACSecret)
+	assert.Equal(t, "Bearer old", next.Targets[0].Webhook.Headers["Authorization"])
+}
+
+func TestPreserveSecretsAllowsHeaderReplacementAndHMACClear(t *testing.T) {
+	t.Parallel()
+
+	next := &Settings{Targets: []Target{{
+		ID:   "webhook-1",
+		Type: ProviderWebhook,
+		Webhook: &WebhookTarget{
+			Headers:         map[string]string{"X-New": "value"},
+			ClearHMACSecret: true,
+		},
+	}}}
+	existing := &Settings{Targets: []Target{{
+		ID:   "webhook-1",
+		Type: ProviderWebhook,
+		Webhook: &WebhookTarget{
+			URL:        "https://example.com/webhook",
+			Headers:    map[string]string{"Authorization": "Bearer old"},
+			HMACSecret: "old-secret",
+		},
+	}}}
+
+	PreserveSecrets(next, existing)
+	assert.Equal(t, "https://example.com/webhook", next.Targets[0].Webhook.URL)
+	assert.Empty(t, next.Targets[0].Webhook.HMACSecret)
+	assert.NotContains(t, next.Targets[0].Webhook.Headers, "Authorization")
+	assert.Equal(t, "value", next.Targets[0].Webhook.Headers["X-New"])
+}
+
+func TestNormalizeRequiresWebhookHTTPSUnlessExplicitlyAllowed(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{
+				URL: "http://example.com/webhook",
+			},
+		}},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	_, err = Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{
+				URL:               "http://example.com/webhook",
+				AllowInsecureHTTP: true,
+			},
+		}},
+	}, "tester")
+	require.NoError(t, err)
+}
+
+func TestNormalizeRejectsSlackIncomingWebhookAsGenericWebhook(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{
+				URL: "https://hooks.slack.com/services/T000/B000/secret",
+			},
+		}},
+	}, "tester")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+	assert.Contains(t, err.Error(), "slack provider")
+
+	_, err = Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderSlack,
+			Enabled: true,
+			Slack: &SlackTarget{
+				WebhookURL: "https://hooks.slack.com/services/T000/B000/secret",
+			},
+		}},
+	}, "tester")
+	require.NoError(t, err)
+}
+
+func TestNormalizeSettingsSupportsReusableChannelSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	settings := &Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events: []eventstore.EventType{
+			eventstore.TypeDAGRunFailed,
+			eventstore.TypeDAGRunSucceeded,
+		},
+		Subscriptions: []Subscription{{
+			ChannelID: "channel-1",
+			Enabled:   true,
+			Events: []eventstore.EventType{
+				eventstore.TypeDAGRunFailed,
+				eventstore.TypeDAGRunFailed,
+			},
+		}},
+	}
+
+	normalized, err := Normalize(settings, "tester")
+	require.NoError(t, err)
+	require.Len(t, normalized.Subscriptions, 1)
+	assert.NotEmpty(t, normalized.Subscriptions[0].ID)
+	assert.Equal(t, "channel-1", normalized.Subscriptions[0].ChannelID)
+	assert.Equal(t, []eventstore.EventType{eventstore.TypeDAGRunFailed}, normalized.Subscriptions[0].Events)
+	assert.True(t, IsSubscriptionEventEnabled(normalized, normalized.Subscriptions[0], eventstore.TypeDAGRunFailed))
+	assert.False(t, IsSubscriptionEventEnabled(normalized, normalized.Subscriptions[0], eventstore.TypeDAGRunSucceeded))
+}
+
+func TestNormalizeSettingsRejectsDuplicateChannelSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Subscriptions: []Subscription{
+			{ChannelID: "channel-1", Enabled: true},
+			{ChannelID: "channel-1", Enabled: true},
+		},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+}
+
+func TestNormalizeChannelPreservesProviderValidation(t *testing.T) {
+	t.Parallel()
+
+	channel, err := NormalizeChannel(&Channel{
+		Name:    "Ops Webhook",
+		Type:    ProviderWebhook,
+		Enabled: true,
+		Webhook: &WebhookTarget{
+			URL: "https://example.com/webhook",
+		},
+	}, "tester")
+	require.NoError(t, err)
+	assert.NotEmpty(t, channel.ID)
+	assert.Equal(t, "Ops Webhook", channel.Name)
+
+	_, err = NormalizeChannel(&Channel{
+		Name:    "Internal",
+		Type:    ProviderWebhook,
+		Enabled: true,
+		Webhook: &WebhookTarget{
+			URL: "http://127.0.0.1:8080/webhook",
+		},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+}
+
+func TestNormalizeWorkspaceSettingsValidatesSMTP(t *testing.T) {
+	t.Parallel()
+
+	settings, err := NormalizeWorkspaceSettings(&WorkspaceSettings{
+		SMTP: &SMTPConfig{
+			Host:     " smtp.example.com ",
+			Port:     " 587 ",
+			Username: " user ",
+			Password: "secret",
+			From:     " Flow <flow@example.com> ",
+		},
+	}, "tester")
+	require.NoError(t, err)
+	require.NotNil(t, settings.SMTP)
+	assert.Equal(t, "smtp.example.com", settings.SMTP.Host)
+	assert.Equal(t, "587", settings.SMTP.Port)
+	assert.Equal(t, "user", settings.SMTP.Username)
+	assert.Equal(t, "Flow <flow@example.com>", settings.SMTP.From)
+	assert.NotZero(t, settings.CreatedAt)
+	assert.NotZero(t, settings.UpdatedAt)
+	assert.Equal(t, "tester", settings.UpdatedBy)
+
+	_, err = NormalizeWorkspaceSettings(&WorkspaceSettings{
+		SMTP: &SMTPConfig{Host: "smtp.example.com", Port: "not-a-port", From: "flow@example.com"},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	_, err = NormalizeWorkspaceSettings(&WorkspaceSettings{
+		SMTP: &SMTPConfig{Host: "smtp.example.com", Port: "587", From: "invalid"},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	oauthSettings, err := NormalizeWorkspaceSettings(&WorkspaceSettings{
+		SMTP: &SMTPConfig{
+			Username: " sender@example.com ",
+			OAuth: &oauthconfig.Config{
+				Provider: oauthconfig.ProviderMicrosoft, TenantID: " tenant ",
+				ClientID: " client ", ClientSecret: "secret",
+			},
+			From: "sender@example.com",
+		},
+	}, "tester")
+	require.NoError(t, err)
+	require.NotNil(t, oauthSettings.SMTP)
+	assert.Equal(t, "smtp.office365.com", oauthSettings.SMTP.Host)
+	assert.Equal(t, "587", oauthSettings.SMTP.Port)
+	assert.Equal(t, "sender@example.com", oauthSettings.SMTP.Username)
+	public := oauthSettings.ToPublic()
+	require.NotNil(t, public.SMTP)
+	require.NotNil(t, public.SMTP.OAuth)
+	assert.True(t, public.SMTP.OAuth.ClientSecretConfigured)
+	assert.Empty(t, public.SMTP.OAuth.RefreshTokenConfigured)
+}
+
+func TestNormalizeRouteSetValidatesScopeAndRoutes(t *testing.T) {
+	t.Parallel()
+
+	routeSet, err := NormalizeRouteSet(&RouteSet{
+		Scope:     RouteScopeWorkspace,
+		Workspace: "ops",
+		Enabled:   true,
+		Routes: []Route{{
+			ChannelID: "channel-1",
+			Enabled:   true,
+			Events:    []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		}},
+	}, "tester")
+	require.NoError(t, err)
+	assert.NotEmpty(t, routeSet.ID)
+	assert.Equal(t, RouteScopeWorkspace, routeSet.Scope)
+	assert.Equal(t, "ops", routeSet.Workspace)
+	require.Len(t, routeSet.Routes, 1)
+	assert.NotEmpty(t, routeSet.Routes[0].ID)
+	assert.Equal(t, []eventstore.EventType{eventstore.TypeDAGRunFailed}, routeSet.Routes[0].Events)
+
+	_, err = NormalizeRouteSet(&RouteSet{
+		Scope:   RouteScopeGlobal,
+		Enabled: true,
+		Routes: []Route{
+			{ChannelID: "channel-1", Enabled: true},
+			{ChannelID: "channel-1", Enabled: true},
+		},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	_, err = NormalizeRouteSet(&RouteSet{
+		Scope:     RouteScopeWorkspace,
+		Workspace: "global",
+		Enabled:   true,
+		Routes:    []Route{{ChannelID: "channel-1", Enabled: true}},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+}
+
+func TestIsRouteEventEnabledDefaultsToOperationalEvents(t *testing.T) {
+	t.Parallel()
+
+	routeSet := &RouteSet{Enabled: true}
+	route := Route{Enabled: true}
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunFailed))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunWaiting))
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
+
+	route.Events = []eventstore.EventType{eventstore.TypeDAGRunSucceeded}
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunFailed))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
+
+	route.Events = []eventstore.EventType{eventstore.TypeDAGRunPartiallySucceeded}
+	assert.False(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunSucceeded))
+	assert.True(t, IsRouteEventEnabled(routeSet, route, eventstore.TypeDAGRunPartiallySucceeded))
+}
+
+func TestPreserveWorkspaceSecrets(t *testing.T) {
+	t.Parallel()
+
+	next := &WorkspaceSettings{SMTP: &SMTPConfig{
+		Host:     "smtp.example.com",
+		Port:     "587",
+		Username: "user",
+		From:     "flow@example.com",
+	}}
+	existing := &WorkspaceSettings{SMTP: &SMTPConfig{Password: "old-secret"}}
+
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Equal(t, "old-secret", next.SMTP.Password)
+
+	next.SMTP.ClearPassword = true
+	next.SMTP.Password = ""
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Empty(t, next.SMTP.Password)
+
+	existing.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleRefresh, ClientID: "client",
+			ClientSecret: "old-client-secret", RefreshToken: "old-refresh-token",
+		},
+	}
+	next.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleRefresh, ClientID: "client",
+		},
+	}
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Equal(t, "old-client-secret", next.SMTP.OAuth.ClientSecret)
+	assert.Equal(t, "old-refresh-token", next.SMTP.OAuth.RefreshToken)
+
+	next.SMTP.Username = "other@example.com"
+	next.SMTP.OAuth.ClientSecret = ""
+	next.SMTP.OAuth.RefreshToken = ""
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Empty(t, next.SMTP.OAuth.ClientSecret)
+	assert.Empty(t, next.SMTP.OAuth.RefreshToken)
+
+	existing.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth: &oauthconfig.Config{
+			Provider: oauthconfig.ProviderGoogleServiceAccount, ServiceAccountJSON: "service-account-json",
+		},
+	}
+	next.SMTP = &SMTPConfig{
+		Username: "sender@example.com",
+		OAuth:    &oauthconfig.Config{Provider: oauthconfig.ProviderGoogleServiceAccount},
+	}
+	PreserveWorkspaceSecrets(next, existing)
+	assert.Equal(t, "service-account-json", next.SMTP.OAuth.ServiceAccountJSON)
+}
+
+func TestPreserveChannelSecrets(t *testing.T) {
+	t.Parallel()
+
+	next := &Channel{
+		ID:      "channel-1",
+		Name:    "Ops Webhook",
+		Type:    ProviderWebhook,
+		Enabled: true,
+		Webhook: &WebhookTarget{},
+	}
+	existing := &Channel{
+		ID:      "channel-1",
+		Name:    "Ops Webhook",
+		Type:    ProviderWebhook,
+		Enabled: true,
+		Webhook: &WebhookTarget{
+			URL:        "https://example.com/webhook",
+			Headers:    map[string]string{"Authorization": "Bearer old"},
+			HMACSecret: "old-secret",
+		},
+	}
+
+	PreserveChannelSecrets(next, existing)
+	assert.Equal(t, "https://example.com/webhook", next.Webhook.URL)
+	assert.Equal(t, "old-secret", next.Webhook.HMACSecret)
+	assert.Equal(t, "Bearer old", next.Webhook.Headers["Authorization"])
+}
+
+func TestNormalizeRejectsPrivateWebhookTargetUnlessExplicitlyAllowed(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{
+				URL:               "http://127.0.0.1:8080/webhook",
+				AllowInsecureHTTP: true,
+			},
+		}},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	_, err = Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderWebhook,
+			Enabled: true,
+			Webhook: &WebhookTarget{
+				URL:                 "http://127.0.0.1:8080/webhook",
+				AllowInsecureHTTP:   true,
+				AllowPrivateNetwork: true,
+			},
+		}},
+	}, "tester")
+	require.NoError(t, err)
+}
+
+func TestNormalizeRejectsInvalidTelegramTopicID(t *testing.T) {
+	t.Parallel()
+
+	for _, topicID := range []string{"not-a-number", "0", "-1"} {
+		_, err := Normalize(&Settings{
+			DAGName: "daily-report",
+			Enabled: true,
+			Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+			Targets: []Target{{
+				Type:    ProviderTelegram,
+				Enabled: true,
+				Telegram: &TelegramTarget{
+					BotToken: "12345:secret",
+					ChatID:   "67890",
+					TopicID:  topicID,
+				},
+			}},
+		}, "tester")
+		assert.ErrorIs(t, err, ErrInvalidSettings, "topicID=%q", topicID)
+
+		_, err = NormalizeChannel(&Channel{
+			Name:    "Ops Telegram",
+			Type:    ProviderTelegram,
+			Enabled: true,
+			Telegram: &TelegramTarget{
+				BotToken: "12345:secret",
+				ChatID:   "67890",
+				TopicID:  topicID,
+			},
+		}, "tester")
+		assert.ErrorIs(t, err, ErrInvalidSettings, "topicID=%q", topicID)
+	}
+}
+
+func TestPreviewSecretMultibyte(t *testing.T) {
+	t.Parallel()
+
+	// A byte-level head/tail cut must not split a multibyte rune.
+	got := PreviewSecret("ab界界界界界cd")
+	assert.True(t, utf8.ValidString(got))
+	assert.Equal(t, "ab界界...界界cd", got)
+
+	// Short multibyte secrets are fully masked.
+	assert.Equal(t, "********", PreviewSecret("ab界界cd"))
+}
+
+func TestNormalizeChannelAcceptsCommand(t *testing.T) {
+	t.Parallel()
+
+	channel, err := NormalizeChannel(&Channel{
+		Name:    "Desktop",
+		Type:    ProviderCommand,
+		Enabled: true,
+		Command: &CommandTarget{Command: "  notify-send \"$DAG_NAME\"  "},
+	}, "tester")
+	require.NoError(t, err)
+	require.NotNil(t, channel.Command)
+	assert.Equal(t, "notify-send \"$DAG_NAME\"", channel.Command.Command)
+
+	public := channel.ToPublic()
+	require.NotNil(t, public.Command)
+	assert.Equal(t, channel.Command.Command, public.Command.Command)
+}
+
+func TestNormalizeChannelRejectsEmptyCommand(t *testing.T) {
+	t.Parallel()
+
+	_, err := NormalizeChannel(&Channel{
+		Name:    "Desktop",
+		Type:    ProviderCommand,
+		Enabled: true,
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+
+	_, err = NormalizeChannel(&Channel{
+		Name:    "Desktop",
+		Type:    ProviderCommand,
+		Enabled: true,
+		Command: &CommandTarget{Command: "bad\x00command"},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrInvalidSettings)
+}
+
+func TestNormalizeRejectsCommandTargetOnDAGSettings(t *testing.T) {
+	t.Parallel()
+
+	_, err := Normalize(&Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []Target{{
+			Type:    ProviderCommand,
+			Enabled: true,
+			Command: &CommandTarget{Command: "notify-send done"},
+		}},
+	}, "tester")
+	assert.ErrorIs(t, err, ErrUnsupportedTarget)
+}

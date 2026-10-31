@@ -1,0 +1,11 @@
+working_dir: .
+env:
+  - SERVICE=api
+steps:
+  - name: write
+    action: exec
+    with:
+      command: ./write_arg
+      args:
+        - direct-exec.txt
+        - ${SERVICE} ${MISSING}

@@ -1,0 +1,66 @@
+package testutil
+
+import (
+	"context"
+	"io"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/dagrun"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+)
+
+var _ persis.DAGRunStore = DAGRunStoreStub{}
+
+// DAGRunStoreStub fails when a test calls a store method it did not override.
+type DAGRunStoreStub struct{}
+
+func (DAGRunStoreStub) CreateAttempt(context.Context, persis.DAGRunCreateAttemptRequest) (dagrun.Attempt, error) {
+	panic("unexpected DAG-run store call: CreateAttempt")
+}
+
+func (DAGRunStoreStub) RecentStatuses(context.Context, string, int) ([]ir.DAGRunStatus, error) {
+	panic("unexpected DAG-run store call: RecentStatuses")
+}
+
+func (DAGRunStoreStub) LatestAttempt(context.Context, persis.DAGRunLatestAttemptQuery) (dagrun.Attempt, error) {
+	panic("unexpected DAG-run store call: LatestAttempt")
+}
+
+func (DAGRunStoreStub) LatestStatuses(context.Context, persis.DAGRunLatestStatusesQuery) ([]*ir.DAGRunStatus, error) {
+	panic("unexpected DAG-run store call: LatestStatuses")
+}
+
+func (DAGRunStoreStub) QueryStatuses(context.Context, persis.DAGRunStatusQuery) (persis.DAGRunStatusPage, error) {
+	panic("unexpected DAG-run store call: QueryStatuses")
+}
+
+func (DAGRunStoreStub) CompareAndSwapLatestAttemptStatus(
+	context.Context,
+	persis.DAGRunCompareAndSwapStatusRequest,
+) (*ir.DAGRunStatus, bool, error) {
+	panic("unexpected DAG-run store call: CompareAndSwapLatestAttemptStatus")
+}
+
+func (DAGRunStoreStub) FindAttempt(context.Context, ir.DAGRunRef) (dagrun.Attempt, error) {
+	panic("unexpected DAG-run store call: FindAttempt")
+}
+
+func (DAGRunStoreStub) FindSubAttempt(context.Context, ir.DAGRunRef, string) (dagrun.Attempt, error) {
+	panic("unexpected DAG-run store call: FindSubAttempt")
+}
+
+func (DAGRunStoreStub) RemoveOldDAGRuns(context.Context, persis.DAGRunRetentionRequest) ([]ir.DAGRunRef, error) {
+	panic("unexpected DAG-run store call: RemoveOldDAGRuns")
+}
+
+func (DAGRunStoreStub) RemoveDAGRun(context.Context, persis.DAGRunRemoveRequest) error {
+	panic("unexpected DAG-run store call: RemoveDAGRun")
+}
+
+func (DAGRunStoreStub) PruneArtifacts(context.Context, persis.ArtifactPruneRequest) (*persis.ArtifactPruneResult, error) {
+	panic("unexpected DAG-run store call: PruneArtifacts")
+}
+
+func (DAGRunStoreStub) OpenLog(context.Context, string) (io.ReadCloser, error) {
+	panic("unexpected DAG-run store call: OpenLog")
+}

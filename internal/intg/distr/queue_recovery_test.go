@@ -1,0 +1,333 @@
+package distr_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+	"github.com/stretchr/testify/require"
+)
+
+func TestExecution_QueuedDispatch_ConsumesBulkItems(t *testing.T) {
+	const (
+		queueName = "bulk-q"
+	)
+	totalRuns := queuedDispatchBulkRunCount()
+
+	f := newTestFixture(t, `
+type: graph
+name: worker-bulk-queue-test
+queue: bulk-q
+worker_selector:
+  tier: "queue"
+steps:
+  - name: step1
+    action: noop
+`,
+		withWorkerCount(queuedDispatchWorkerCount()),
+		withWorkerMaxActiveRuns(queuedDispatchWorkerMaxActiveRuns()),
+		withLabels(map[string]string{"tier": "queue"}),
+		withConfigMutator(func(c *config.Config) {
+			c.Queues.Enabled = true
+			c.Queues.Config = []config.QueueConfig{{
+				Name:          queueName,
+				MaxActiveRuns: 100,
+			}}
+		}),
+	)
+	defer f.cleanup()
+
+	for range totalRuns {
+		require.NoError(t, f.enqueueDirect())
+	}
+
+	requireQueuedItemCountEventually(t, f, totalRuns, 60*time.Second)
+
+	f.startScheduler(30 * time.Second)
+
+	requireAllQueuedRunsConsumed(t, f, totalRuns, queuedDispatchBulkTimeout())
+}
+
+func queuedDispatchBulkRunCount() int {
+	if runtime.GOOS == "windows" {
+		return 5
+	}
+	if raceEnabled() {
+		return 20
+	}
+	return 1000
+}
+
+func queuedDispatchWorkerCount() int {
+	if runtime.GOOS == "windows" {
+		return 2
+	}
+	if raceEnabled() {
+		return 2
+	}
+	return 10
+}
+
+func queuedDispatchWorkerMaxActiveRuns() int {
+	if runtime.GOOS == "windows" {
+		return 1
+	}
+	if raceEnabled() {
+		return 2
+	}
+	return 10
+}
+
+func queuedDispatchBulkTimeout() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 5 * time.Minute
+	}
+	if raceEnabled() {
+		return 2 * time.Minute
+	}
+	return 10 * time.Minute
+}
+
+func TestExecution_QueuedDispatch_RecoversWhenWorkerRegistersLater(t *testing.T) {
+	f := newTestFixture(t, `
+type: graph
+name: worker-late-worker-test
+worker_selector:
+  tier: "queue"
+steps:
+  - name: step1
+    run: echo "executed"
+`, withWorkerCount(0), withWorkerMaxActiveRuns(1))
+	defer f.cleanup()
+
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(30 * time.Second)
+
+	requireQueuedRunStillPending(t, f, 2*time.Second)
+
+	f.setupWorker("late-worker", map[string]string{"tier": "queue"}, "")
+
+	status := f.waitForStatus(ir.Succeeded, 20*time.Second)
+	require.Equal(t, "late-worker", status.WorkerID)
+	requireQueueEventuallyEmpty(t, f)
+}
+
+func TestExecution_QueuedDispatch_RecoversWhenMatchingWorkerRegistersLater(t *testing.T) {
+	f := newTestFixture(t, `
+type: graph
+name: worker-selector-recovery-test
+worker_selector:
+  tier: "queue"
+steps:
+  - name: step1
+    run: echo "executed"
+`, withWorkerCount(0), withWorkerMaxActiveRuns(1))
+	defer f.cleanup()
+
+	f.setupWorker("mismatched-worker", map[string]string{"tier": "other"}, "")
+
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(30 * time.Second)
+
+	requireQueuedRunStillPending(t, f, 2*time.Second)
+
+	f.setupWorker("matching-worker", map[string]string{"tier": "queue"}, "")
+
+	status := f.waitForStatus(ir.Succeeded, 20*time.Second)
+	require.Equal(t, "matching-worker", status.WorkerID)
+	requireQueueEventuallyEmpty(t, f)
+}
+
+// A queued run dispatched while its only worker is busy keeps waiting for that
+// worker past the dispatch reservation TTL. The scheduler has already dequeued
+// it, so dropping its pending task would leave it queued with nothing left to
+// run it.
+func TestExecution_QueuedDispatch_WaitsForBusyWorker(t *testing.T) {
+	const queueName = "busy-worker-q"
+	releaseFile := filepath.Join(t.TempDir(), "busy-worker.release")
+	t.Cleanup(func() {
+		_ = os.WriteFile(releaseFile, []byte("ok"), 0o600)
+	})
+
+	f := newTestFixture(t, fmt.Sprintf(`
+type: graph
+name: busy-worker-test
+queue: %s
+worker_selector:
+  test: "true"
+steps:
+  - name: wait
+    run: |
+%s
+`, queueName, indentYAMLBlock(waitForReleaseFileScript(releaseFile), 6)),
+		withWorkerMaxActiveRuns(1),
+		withStaleThresholds(testStaleHeartbeatThreshold, testStaleLeaseThreshold),
+		withZombieDetectionInterval(testZombieDetectorInterval),
+		withConfigMutator(func(c *config.Config) {
+			c.Queues.Config = []config.QueueConfig{{Name: queueName, MaxActiveRuns: 2}}
+		}),
+	)
+	defer f.cleanup()
+
+	require.NoError(t, f.enqueue())
+	require.NoError(t, f.enqueue())
+	requireQueuedItemCountEventually(t, f, 2, 5*time.Second)
+	f.startScheduler(30 * time.Second)
+
+	oneRunningOneQueued := func() bool {
+		counts, _, err := dagRunStatusCounts(f)
+		if err != nil {
+			return false
+		}
+		count, err := queuedItemCount(f)
+		return err == nil && count == 0 && counts[ir.Running] == 1 && counts[ir.Queued] == 1
+	}
+	require.Eventually(t, oneRunningOneQueued, distrTestTimeout(15*time.Second), 100*time.Millisecond,
+		"both runs should leave the queue, one running and one waiting for the worker")
+	require.Never(t, func() bool { return !oneRunningOneQueued() }, 3*testStaleLeaseThreshold, 200*time.Millisecond,
+		"the waiting run should stay queued past the reservation TTL")
+
+	require.NoError(t, os.WriteFile(releaseFile, []byte("ok"), 0o600))
+	requireAllQueuedRunsConsumed(t, f, 2, distrTestTimeout(30*time.Second))
+}
+
+func requireQueuedRunStillPending(t *testing.T, f *testFixture, duration time.Duration) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		status, err := f.latestStatus()
+		if err != nil {
+			return false
+		}
+		if status.Status != ir.Queued {
+			return false
+		}
+		count, err := queuedItemCount(f)
+		if err != nil {
+			return false
+		}
+		return count == 1
+	}, 10*time.Second, 100*time.Millisecond, "run should remain queued while no usable worker exists")
+
+	require.Never(t, func() bool {
+		status, err := f.latestStatus()
+		if err != nil {
+			return false
+		}
+		count, err := queuedItemCount(f)
+		if err != nil {
+			return false
+		}
+		return status.Status != ir.Queued || count != 1
+	}, duration, 100*time.Millisecond, "queued run should not disappear before a matching worker is available")
+}
+
+func requireQueueEventuallyEmpty(t *testing.T, f *testFixture) {
+	t.Helper()
+
+	requireQueuedItemCountEventually(t, f, 0, 10*time.Second)
+}
+
+func queuedItemCount(f *testFixture) (int, error) {
+	items, err := f.coord.QueueStore.ListByDAGName(f.coord.Context, f.dagWrapper.ProcGroup(), f.dagWrapper.Name)
+	if err != nil {
+		return 0, err
+	}
+	return len(items), nil
+}
+
+func requireQueuedItemCountEventually(t *testing.T, f *testFixture, expected int, timeout time.Duration) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		count, err := queuedItemCount(f)
+		return err == nil && count == expected
+	}, timeout, 100*time.Millisecond, "expected %d queued items", expected)
+}
+
+func requireAllQueuedRunsConsumed(t *testing.T, f *testFixture, expectedRuns int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	lastSummary := "no status collected"
+	for time.Now().Before(deadline) {
+		counts, total, err := dagRunStatusCounts(f)
+		if err != nil {
+			lastSummary = err.Error()
+			time.Sleep(time.Second)
+			continue
+		}
+		queueCount, err := queuedItemCount(f)
+		if err != nil {
+			lastSummary = err.Error()
+			time.Sleep(time.Second)
+			continue
+		}
+
+		lastSummary = formatStatusSummary(counts, total, queueCount)
+
+		if total == expectedRuns &&
+			queueCount == 0 &&
+			counts[ir.Succeeded] == expectedRuns &&
+			counts[ir.Queued] == 0 &&
+			counts[ir.Running] == 0 &&
+			counts[ir.NotStarted] == 0 &&
+			counts[ir.Failed] == 0 &&
+			counts[ir.Aborted] == 0 &&
+			counts[ir.Waiting] == 0 &&
+			counts[ir.Rejected] == 0 &&
+			counts[ir.PartiallySucceeded] == 0 {
+			return
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	t.Fatalf("expected %d queued runs to be fully consumed; last state: %s", expectedRuns, lastSummary)
+}
+
+func dagRunStatusCounts(f *testFixture) (map[ir.Status]int, int, error) {
+	statuses, err := f.coord.DAGRunRepository.ListStatuses(
+		f.coord.Context, persis.DAGRunListOptions{ExactName: f.dagWrapper.Name, Unbounded: true},
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	counts := make(map[ir.Status]int)
+	for _, status := range statuses {
+		if status == nil {
+			continue
+		}
+		counts[status.Status]++
+	}
+
+	return counts, len(statuses), nil
+}
+
+func formatStatusSummary(counts map[ir.Status]int, total, queueCount int) string {
+	return "total=" + itoa(total) +
+		" queue=" + itoa(queueCount) +
+		" succeeded=" + itoa(counts[ir.Succeeded]) +
+		" queued=" + itoa(counts[ir.Queued]) +
+		" running=" + itoa(counts[ir.Running]) +
+		" not_started=" + itoa(counts[ir.NotStarted]) +
+		" failed=" + itoa(counts[ir.Failed]) +
+		" aborted=" + itoa(counts[ir.Aborted]) +
+		" waiting=" + itoa(counts[ir.Waiting]) +
+		" rejected=" + itoa(counts[ir.Rejected]) +
+		" partial=" + itoa(counts[ir.PartiallySucceeded])
+}
+
+func itoa(v int) string {
+	return strconv.Itoa(v)
+}

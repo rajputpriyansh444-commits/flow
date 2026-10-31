@@ -1,0 +1,45 @@
+package cmd
+
+import (
+	"context"
+	"path/filepath"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/browserhost"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+)
+
+// startBrowserReaper closes browsers that browser steps left open for input
+// once no step can resume them, and browser sessions that went idle. It
+// stops when ctx is cancelled.
+func startBrowserReaper(ctx context.Context, dataDir string, repository *persis.DAGRunRepository) {
+	if dataDir == "" {
+		return
+	}
+	go browserhost.RunReaper(ctx, filepath.Join(dataDir, browserhost.DataDirName), browserStepResumable(repository))
+}
+
+// browserStepResumable keeps a browser while its step has not finished. A run
+// whose status this process cannot read keeps its browser until the ask
+// deadline.
+func browserStepResumable(repository *persis.DAGRunRepository) browserhost.ResumableFunc {
+	if repository == nil {
+		return nil
+	}
+	return func(ctx context.Context, record browserhost.Record) bool {
+		attempt, err := repository.FindAttempt(ctx, ir.NewDAGRunRef(record.DAGName, record.DAGRunID))
+		if err != nil {
+			return true
+		}
+		status, err := attempt.ReadStatus(ctx)
+		if err != nil || status == nil {
+			return true
+		}
+		for _, node := range status.Nodes {
+			if node != nil && node.Step.Name == record.StepName {
+				return !node.Status.IsDone()
+			}
+		}
+		return true
+	}
+}

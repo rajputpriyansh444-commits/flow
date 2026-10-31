@@ -1,0 +1,43 @@
+/**
+ * Copies text to the clipboard, returning whether the copy succeeded.
+ *
+ * Must be called from a user gesture handler: the fallback path is rejected by
+ * browsers otherwise.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // The Clipboard API is unavailable outside secure contexts and when
+    // permission is denied.
+  }
+
+  const textArea = document.createElement('textarea');
+  textArea.value = text;
+  document.body.appendChild(textArea);
+  textArea.select();
+  try {
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    document.body.removeChild(textArea);
+  }
+}
+
+/**
+ * The text of the system clipboard, or '' when the browser does not give it
+ * or the user denies the read.
+ */
+export async function readClipboardText(): Promise<string> {
+  const clipboard = navigator.clipboard;
+  if (!clipboard?.readText) {
+    return '';
+  }
+  try {
+    return await clipboard.readText();
+  } catch {
+    return '';
+  }
+}

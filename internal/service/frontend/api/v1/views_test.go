@@ -1,0 +1,804 @@
+package api_test
+
+import (
+	"context"
+	"testing"
+
+	apigen "github.com/rajputpriyansh444-commits/flow/api/v1"
+	"github.com/rajputpriyansh444-commits/flow/internal/auth"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+	persiststore "github.com/rajputpriyansh444-commits/flow/internal/persis/store"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis/testutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime"
+	apiv1 "github.com/rajputpriyansh444-commits/flow/internal/service/frontend/api/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// stubAuthService satisfies apiv1.AuthService via an embedded nil interface so
+// the API treats auth as enabled. Its methods are never invoked by the RBAC
+// checks under test.
+type stubAuthService struct{ apiv1.AuthService }
+
+func newViewsTestAPI(t *testing.T, opts ...apiv1.APIOption) *apiv1.API {
+	t.Helper()
+	vs := persiststore.NewViewStore(testutil.NewMemoryBackend().Collection(persis.CollectionViews))
+	cfg := &config.Config{}
+	allOpts := append([]apiv1.APIOption{apiv1.WithViewStore(vs)}, opts...)
+	return apiv1.New(nil, nil, nil, nil, runtime.Manager{}, cfg, nil, nil, prometheus.NewRegistry(), nil, allOpts...)
+}
+
+func mustCreateView(t *testing.T, api *apiv1.API, ctx context.Context, spec apigen.ViewSpec) apigen.View {
+	t.Helper()
+	resp, err := api.CreateView(ctx, apigen.CreateViewRequestObject{Body: &spec})
+	require.NoError(t, err)
+	created, ok := resp.(apigen.CreateView201JSONResponse)
+	require.True(t, ok, "expected 201, got %T", resp)
+	return apigen.View(created)
+}
+
+func TestViewsAPI_CreateDefaultsAndActor(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:         "Prod",
+		IntervalDays: 3,
+		Labels:       &[]string{"team=platform"},
+	})
+
+	assert.NotEmpty(t, created.Id)
+	assert.Equal(t, "Prod", created.Name)
+	assert.Equal(t, "kanban", created.Type, "type defaults to kanban")
+	require.NotNil(t, created.CreatedBy)
+	assert.Equal(t, "admin", *created.CreatedBy, "no-auth actor is admin")
+	require.NotNil(t, created.Labels)
+	assert.Equal(t, []string{"team=platform"}, *created.Labels)
+	require.NotNil(t, created.Columns)
+	assert.Equal(t, []apigen.ViewColumn{
+		apigen.ViewColumnQueued,
+		apigen.ViewColumnRunning,
+		apigen.ViewColumnReview,
+		apigen.ViewColumnDone,
+		apigen.ViewColumnFailed,
+	}, *created.Columns)
+}
+
+func TestViewsAPI_CreatePreservesColumnVisibilityAndOrder(t *testing.T) {
+	columns := []apigen.ViewColumn{apigen.ViewColumnFailed, apigen.ViewColumnRunning}
+	created := mustCreateView(t, newViewsTestAPI(t), context.Background(), apigen.ViewSpec{
+		Name:         "Failures",
+		IntervalDays: 3,
+		Columns:      &columns,
+	})
+
+	require.NotNil(t, created.Columns)
+	assert.Equal(t, columns, *created.Columns)
+}
+
+func TestViewsAPI_CreateWorkflowView(t *testing.T) {
+	viewType := apigen.ViewSpecTypeWorkflow
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	sortField := apigen.ViewSortFieldNextRun
+	sortOrder := apigen.ViewSortOrderDesc
+	isDefault := true
+	pinned := true
+	activeOnly := true
+	created := mustCreateView(t, newViewsTestAPI(t), context.Background(), apigen.ViewSpec{
+		Name:           "Production workflows",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		SortField:      &sortField,
+		SortOrder:      &sortOrder,
+		ActiveOnly:     &activeOnly,
+		IsDefault:      &isDefault,
+		Pinned:         &pinned,
+	})
+
+	assert.Equal(t, "workflow", created.Type)
+	require.NotNil(t, created.WorkspaceScope)
+	assert.Equal(t, workspaceScope, *created.WorkspaceScope)
+	require.NotNil(t, created.SortField)
+	assert.Equal(t, sortField, *created.SortField)
+	require.NotNil(t, created.SortOrder)
+	assert.Equal(t, sortOrder, *created.SortOrder)
+	require.NotNil(t, created.IsDefault)
+	assert.True(t, *created.IsDefault)
+	require.NotNil(t, created.ActiveOnly)
+	assert.True(t, *created.ActiveOnly)
+	require.NotNil(t, created.Pinned)
+	assert.True(t, *created.Pinned)
+}
+
+func TestViewsAPI_CreateRunView(t *testing.T) {
+	viewType := apigen.ViewSpecTypeRun
+	workspaceScope := apigen.ViewWorkspaceScopeWorkspace
+	dateMode := apigen.RunDateModePreset
+	datePreset := apigen.RunDatePresetLast7days
+	specificPeriod := apigen.RunSpecificPeriodDate
+	isDefault := true
+	pinned := true
+	workspace := "production"
+	dagRunId := "019df6cf-0127-7340-bd96-d51bc1453045"
+	runStatus := "5"
+	specificValue := "2026-09-15"
+	fromDate := "2026-09-15T00:00"
+	toDate := "2026-09-15T23:59"
+	created := mustCreateView(t, newViewsTestAPI(t), context.Background(), apigen.ViewSpec{
+		Name:           "Failed runs",
+		Type:           &viewType,
+		IntervalDays:   1,
+		Workspace:      &workspace,
+		WorkspaceScope: &workspaceScope,
+		DagRunId:       &dagRunId,
+		RunStatus:      &runStatus,
+		DateMode:       &dateMode,
+		DatePreset:     &datePreset,
+		SpecificPeriod: &specificPeriod,
+		SpecificValue:  &specificValue,
+		FromDate:       &fromDate,
+		ToDate:         &toDate,
+		IsDefault:      &isDefault,
+		Pinned:         &pinned,
+	})
+
+	assert.Equal(t, "run", created.Type)
+	require.NotNil(t, created.WorkspaceScope)
+	assert.Equal(t, workspaceScope, *created.WorkspaceScope)
+	require.NotNil(t, created.DagRunId)
+	assert.Equal(t, dagRunId, *created.DagRunId)
+	require.NotNil(t, created.RunStatus)
+	assert.Equal(t, runStatus, *created.RunStatus)
+	require.NotNil(t, created.DateMode)
+	assert.Equal(t, dateMode, *created.DateMode)
+	require.NotNil(t, created.DatePreset)
+	assert.Equal(t, datePreset, *created.DatePreset)
+	require.NotNil(t, created.SpecificPeriod)
+	assert.Equal(t, specificPeriod, *created.SpecificPeriod)
+	require.NotNil(t, created.SpecificValue)
+	assert.Equal(t, specificValue, *created.SpecificValue)
+	require.NotNil(t, created.FromDate)
+	assert.Equal(t, fromDate, *created.FromDate)
+	require.NotNil(t, created.ToDate)
+	assert.Equal(t, toDate, *created.ToDate)
+	require.NotNil(t, created.IsDefault)
+	assert.True(t, *created.IsDefault)
+	require.NotNil(t, created.Pinned)
+	assert.True(t, *created.Pinned)
+}
+
+func TestViewsAPI_CreateArtifactView(t *testing.T) {
+	viewType := apigen.ViewSpecTypeArtifact
+	workspaceScope := apigen.ViewWorkspaceScopeWorkspace
+	dateMode := apigen.RunDateModeCustom
+	datePreset := apigen.RunDatePresetAll
+	isDefault := true
+	pinned := true
+	workspace := "production"
+	dagName := "nightly-etl"
+	fileName := "*.csv"
+	fromDate := "2026-09-01T00:00"
+	toDate := "2026-09-30T23:59"
+	created := mustCreateView(t, newViewsTestAPI(t), context.Background(), apigen.ViewSpec{
+		Name:           "Nightly reports",
+		Type:           &viewType,
+		IntervalDays:   1,
+		Workspace:      &workspace,
+		WorkspaceScope: &workspaceScope,
+		DagName:        &dagName,
+		FileName:       &fileName,
+		DateMode:       &dateMode,
+		DatePreset:     &datePreset,
+		FromDate:       &fromDate,
+		ToDate:         &toDate,
+		IsDefault:      &isDefault,
+		Pinned:         &pinned,
+	})
+
+	assert.Equal(t, "artifact", created.Type)
+	require.NotNil(t, created.WorkspaceScope)
+	assert.Equal(t, workspaceScope, *created.WorkspaceScope)
+	require.NotNil(t, created.DagName)
+	assert.Equal(t, dagName, *created.DagName)
+	require.NotNil(t, created.FileName)
+	assert.Equal(t, fileName, *created.FileName)
+	require.NotNil(t, created.DateMode)
+	assert.Equal(t, dateMode, *created.DateMode)
+	require.NotNil(t, created.DatePreset)
+	assert.Equal(t, datePreset, *created.DatePreset)
+	require.NotNil(t, created.FromDate)
+	assert.Equal(t, fromDate, *created.FromDate)
+	require.NotNil(t, created.ToDate)
+	assert.Equal(t, toDate, *created.ToDate)
+	require.NotNil(t, created.IsDefault)
+	assert.True(t, *created.IsDefault)
+	require.NotNil(t, created.Pinned)
+	assert.True(t, *created.Pinned)
+	assert.Nil(t, created.DagRunId, "run-only fields stay out of an artifact view")
+	assert.Nil(t, created.RunStatus)
+	assert.Nil(t, created.SpecificPeriod)
+	assert.Nil(t, created.SpecificValue)
+}
+
+func TestViewsAPI_UpdatePreservesOmittedArtifactSettings(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeArtifact
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	dateMode := apigen.RunDateModeCustom
+	datePreset := apigen.RunDatePresetAll
+	dagName := "nightly-etl"
+	fileName := "*.csv"
+	fromDate := "2026-09-01T00:00"
+	toDate := "2026-09-30T23:59"
+	isDefault := true
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Before",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		DagName:        &dagName,
+		FileName:       &fileName,
+		DateMode:       &dateMode,
+		DatePreset:     &datePreset,
+		FromDate:       &fromDate,
+		ToDate:         &toDate,
+		IsDefault:      &isDefault,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:         "After",
+			Type:         &viewType,
+			IntervalDays: 1,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	require.NotNil(t, updated.FileName)
+	assert.Equal(t, fileName, *updated.FileName)
+	require.NotNil(t, updated.DateMode)
+	assert.Equal(t, dateMode, *updated.DateMode)
+	require.NotNil(t, updated.DatePreset)
+	assert.Equal(t, datePreset, *updated.DatePreset)
+	require.NotNil(t, updated.FromDate)
+	assert.Equal(t, fromDate, *updated.FromDate)
+	require.NotNil(t, updated.ToDate)
+	assert.Equal(t, toDate, *updated.ToDate)
+	require.NotNil(t, updated.IsDefault)
+	assert.True(t, *updated.IsDefault)
+}
+
+// An explicit empty date clears the bound; the nil-preserve branches must not
+// resurrect the value the caller just cleared.
+func TestViewsAPI_UpdateClearsArtifactDateBound(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeArtifact
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	dateMode := apigen.RunDateModeCustom
+	datePreset := apigen.RunDatePresetAll
+	fromDate := "2026-09-01T00:00"
+	toDate := "2026-09-30T23:59"
+	cleared := ""
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Nightly reports",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		DateMode:       &dateMode,
+		DatePreset:     &datePreset,
+		FromDate:       &fromDate,
+		ToDate:         &toDate,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:           "Nightly reports",
+			Type:           &viewType,
+			IntervalDays:   1,
+			WorkspaceScope: &workspaceScope,
+			DateMode:       &dateMode,
+			DatePreset:     &datePreset,
+			FromDate:       &fromDate,
+			ToDate:         &cleared,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	assert.Empty(t, valueOfString(updated.ToDate), "cleared end date must stay cleared")
+	require.NotNil(t, updated.FromDate)
+	assert.Equal(t, fromDate, *updated.FromDate)
+}
+
+func valueOfString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+// A PUT patches: fields the request omits keep their stored value, so a
+// rename must not drop the filters the view was saved with.
+func TestViewsAPI_UpdatePreservesOmittedArtifactFilters(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeArtifact
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	dagName := "reporter"
+	fileName := "**/*.csv"
+	pinned := true
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Nightly reports",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		DagName:        &dagName,
+		FileName:       &fileName,
+		Pinned:         &pinned,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:           "Renamed",
+			Type:           &viewType,
+			IntervalDays:   1,
+			WorkspaceScope: &workspaceScope,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	assert.Equal(t, "Renamed", updated.Name)
+	require.NotNil(t, updated.DagName)
+	assert.Equal(t, dagName, *updated.DagName)
+	require.NotNil(t, updated.FileName)
+	assert.Equal(t, fileName, *updated.FileName)
+	require.NotNil(t, updated.Pinned)
+	assert.True(t, *updated.Pinned)
+}
+
+func TestViewsAPI_WorkflowDefaultIsSharedPerScope(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeWorkflow
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	isDefault := true
+	first := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "First",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		IsDefault:      &isDefault,
+	})
+	second := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Second",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		IsDefault:      &isDefault,
+	})
+
+	listResp, err := api.ListViews(ctx, apigen.ListViewsRequestObject{})
+	require.NoError(t, err)
+	listed, ok := listResp.(apigen.ListViews200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", listResp)
+	defaults := make([]string, 0, 1)
+	for _, item := range listed.Views {
+		if item.IsDefault != nil && *item.IsDefault {
+			defaults = append(defaults, item.Id)
+		}
+	}
+	assert.Equal(t, []string{second.Id}, defaults)
+	assert.NotEqual(t, first.Id, second.Id)
+}
+
+func TestViewsAPI_CreateValidation(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+
+	tests := []struct {
+		name string
+		spec apigen.ViewSpec
+	}{
+		{"empty name", apigen.ViewSpec{Name: "", IntervalDays: 3}},
+		{"interval too large", apigen.ViewSpec{Name: "x", IntervalDays: 31}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := api.CreateView(ctx, apigen.CreateViewRequestObject{Body: &tt.spec})
+			require.NoError(t, err)
+			_, ok := resp.(apigen.CreateView400JSONResponse)
+			assert.True(t, ok, "expected 400, got %T", resp)
+		})
+	}
+}
+
+func TestViewsAPI_CreateRejectsEmptyColumns(t *testing.T) {
+	emptyColumns := []apigen.ViewColumn{}
+	resp, err := newViewsTestAPI(t).CreateView(context.Background(), apigen.CreateViewRequestObject{
+		Body: &apigen.ViewSpec{Name: "x", IntervalDays: 3, Columns: &emptyColumns},
+	})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.CreateView400JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_CreateMissingBody(t *testing.T) {
+	resp, err := newViewsTestAPI(t).CreateView(context.Background(), apigen.CreateViewRequestObject{})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.CreateView400JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_GetAndList(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{Name: "V", IntervalDays: 5})
+
+	getResp, err := api.GetView(ctx, apigen.GetViewRequestObject{ViewId: created.Id})
+	require.NoError(t, err)
+	got, ok := getResp.(apigen.GetView200JSONResponse)
+	require.True(t, ok)
+	assert.Equal(t, created.Id, got.Id)
+
+	listResp, err := api.ListViews(ctx, apigen.ListViewsRequestObject{})
+	require.NoError(t, err)
+	listed, ok := listResp.(apigen.ListViews200JSONResponse)
+	require.True(t, ok)
+	require.Len(t, listed.Views, 1)
+	assert.Equal(t, created.Id, listed.Views[0].Id)
+}
+
+func TestViewsAPI_GetNotFound(t *testing.T) {
+	resp, err := newViewsTestAPI(t).GetView(context.Background(), apigen.GetViewRequestObject{ViewId: "missing"})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.GetView404JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_UpdatePreservesCreator(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{Name: "Before", IntervalDays: 3})
+
+	pinned := true
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body:   &apigen.ViewSpec{Name: "After", IntervalDays: 10, Pinned: &pinned},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok)
+	assert.Equal(t, "After", updated.Name)
+	assert.Equal(t, 10, updated.IntervalDays)
+	require.NotNil(t, updated.Pinned)
+	assert.True(t, *updated.Pinned)
+	assert.Equal(t, created.CreatedAt, updated.CreatedAt, "CreatedAt preserved")
+	require.NotNil(t, updated.CreatedBy)
+	assert.Equal(t, *created.CreatedBy, *updated.CreatedBy, "CreatedBy preserved")
+}
+
+func TestViewsAPI_UpdateWithoutColumnsPreservesExistingLayout(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	columns := []apigen.ViewColumn{apigen.ViewColumnRunning, apigen.ViewColumnQueued}
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:         "Before",
+		IntervalDays: 3,
+		Columns:      &columns,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body:   &apigen.ViewSpec{Name: "After", IntervalDays: 3},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok)
+	require.NotNil(t, updated.Columns)
+	assert.Equal(t, columns, *updated.Columns)
+}
+
+func TestViewsAPI_UpdatePreservesOmittedWorkflowSettings(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeWorkflow
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	sortField := apigen.ViewSortFieldNextRun
+	sortOrder := apigen.ViewSortOrderDesc
+	isDefault := true
+	activeOnly := true
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Before",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		SortField:      &sortField,
+		SortOrder:      &sortOrder,
+		ActiveOnly:     &activeOnly,
+		IsDefault:      &isDefault,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:         "After",
+			Type:         &viewType,
+			IntervalDays: 1,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	require.NotNil(t, updated.WorkspaceScope)
+	assert.Equal(t, workspaceScope, *updated.WorkspaceScope)
+	require.NotNil(t, updated.SortField)
+	assert.Equal(t, sortField, *updated.SortField)
+	require.NotNil(t, updated.SortOrder)
+	assert.Equal(t, sortOrder, *updated.SortOrder)
+	require.NotNil(t, updated.IsDefault)
+	assert.True(t, *updated.IsDefault)
+	require.NotNil(t, updated.ActiveOnly)
+	assert.True(t, *updated.ActiveOnly)
+}
+
+func TestViewsAPI_UpdatePreservesOmittedRunSettings(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeRun
+	workspaceScope := apigen.ViewWorkspaceScopeAll
+	dateMode := apigen.RunDateModeSpecific
+	datePreset := apigen.RunDatePresetToday
+	specificPeriod := apigen.RunSpecificPeriodMonth
+	dagRunId := "run-1"
+	runStatus := "5"
+	specificValue := "2026-09"
+	fromDate := "2026-09-01T00:00"
+	toDate := "2026-09-30T23:59"
+	isDefault := true
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Before",
+		Type:           &viewType,
+		IntervalDays:   1,
+		WorkspaceScope: &workspaceScope,
+		DagRunId:       &dagRunId,
+		RunStatus:      &runStatus,
+		DateMode:       &dateMode,
+		DatePreset:     &datePreset,
+		SpecificPeriod: &specificPeriod,
+		SpecificValue:  &specificValue,
+		FromDate:       &fromDate,
+		ToDate:         &toDate,
+		IsDefault:      &isDefault,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:         "After",
+			Type:         &viewType,
+			IntervalDays: 1,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	require.NotNil(t, updated.DagRunId)
+	assert.Equal(t, dagRunId, *updated.DagRunId)
+	require.NotNil(t, updated.RunStatus)
+	assert.Equal(t, runStatus, *updated.RunStatus)
+	require.NotNil(t, updated.DateMode)
+	assert.Equal(t, dateMode, *updated.DateMode)
+	require.NotNil(t, updated.DatePreset)
+	assert.Equal(t, datePreset, *updated.DatePreset)
+	require.NotNil(t, updated.SpecificPeriod)
+	assert.Equal(t, specificPeriod, *updated.SpecificPeriod)
+	require.NotNil(t, updated.SpecificValue)
+	assert.Equal(t, specificValue, *updated.SpecificValue)
+	require.NotNil(t, updated.FromDate)
+	assert.Equal(t, fromDate, *updated.FromDate)
+	require.NotNil(t, updated.ToDate)
+	assert.Equal(t, toDate, *updated.ToDate)
+	require.NotNil(t, updated.IsDefault)
+	assert.True(t, *updated.IsDefault)
+}
+
+func TestViewsAPI_UpdatePreservesOmittedWorkspace(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	viewType := apigen.ViewSpecTypeWorkflow
+	workspaceScope := apigen.ViewWorkspaceScopeWorkspace
+	workspace := "prod"
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{
+		Name:           "Before",
+		Type:           &viewType,
+		IntervalDays:   1,
+		Workspace:      &workspace,
+		WorkspaceScope: &workspaceScope,
+	})
+
+	resp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: created.Id,
+		Body: &apigen.ViewSpec{
+			Name:         "After",
+			Type:         &viewType,
+			IntervalDays: 1,
+		},
+	})
+	require.NoError(t, err)
+	updated, ok := resp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "expected 200, got %T", resp)
+	require.NotNil(t, updated.Workspace)
+	assert.Equal(t, workspace, *updated.Workspace, "omitted workspace keeps the existing scope")
+	require.NotNil(t, updated.WorkspaceScope)
+	assert.Equal(t, workspaceScope, *updated.WorkspaceScope)
+}
+
+func TestViewsAPI_UpdateNotFound(t *testing.T) {
+	resp, err := newViewsTestAPI(t).UpdateView(context.Background(), apigen.UpdateViewRequestObject{
+		ViewId: "missing",
+		Body:   &apigen.ViewSpec{Name: "x", IntervalDays: 3},
+	})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.UpdateView404JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_Delete(t *testing.T) {
+	ctx := context.Background()
+	api := newViewsTestAPI(t)
+	created := mustCreateView(t, api, ctx, apigen.ViewSpec{Name: "V", IntervalDays: 3})
+
+	resp, err := api.DeleteView(ctx, apigen.DeleteViewRequestObject{ViewId: created.Id})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.DeleteView204Response)
+	assert.True(t, ok)
+
+	getResp, err := api.GetView(ctx, apigen.GetViewRequestObject{ViewId: created.Id})
+	require.NoError(t, err)
+	_, ok = getResp.(apigen.GetView404JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_DeleteNotFound(t *testing.T) {
+	resp, err := newViewsTestAPI(t).DeleteView(context.Background(), apigen.DeleteViewRequestObject{ViewId: "missing"})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.DeleteView404JSONResponse)
+	assert.True(t, ok)
+}
+
+func TestViewsAPI_RBAC_WriteRequiresDeveloper(t *testing.T) {
+	api := newViewsTestAPI(t, apiv1.WithAuthService(stubAuthService{}))
+	spec := apigen.ViewSpec{Name: "x", IntervalDays: 3}
+
+	viewerCtx := auth.WithUser(context.Background(), &auth.User{Username: "v", Role: auth.RoleViewer})
+	_, err := api.CreateView(viewerCtx, apigen.CreateViewRequestObject{Body: &spec})
+	require.Error(t, err, "viewer must be denied write")
+
+	devCtx := auth.WithUser(context.Background(), &auth.User{Username: "d", Role: auth.RoleDeveloper})
+	resp, err := api.CreateView(devCtx, apigen.CreateViewRequestObject{Body: &spec})
+	require.NoError(t, err)
+	_, ok := resp.(apigen.CreateView201JSONResponse)
+	assert.True(t, ok, "developer is allowed to write")
+}
+
+func TestViewsAPI_WorkspaceScopedVisibility(t *testing.T) {
+	api := newViewsTestAPI(t, apiv1.WithAuthService(stubAuthService{}))
+
+	// Seed three views as a full-access admin.
+	adminCtx := auth.WithUser(context.Background(), &auth.User{
+		Username:        "admin",
+		Role:            auth.RoleAdmin,
+		WorkspaceAccess: &auth.WorkspaceAccess{All: true},
+	})
+	wsA := "a"
+	wsB := "b"
+	viewA := mustCreateView(t, api, adminCtx, apigen.ViewSpec{Name: "A", IntervalDays: 1, Workspace: &wsA})
+	viewB := mustCreateView(t, api, adminCtx, apigen.ViewSpec{Name: "B", IntervalDays: 1, Workspace: &wsB})
+	mustCreateView(t, api, adminCtx, apigen.ViewSpec{Name: "All", IntervalDays: 1}) // empty workspace
+
+	// Restricted developer with access to workspace "a" only.
+	devCtx := auth.WithUser(context.Background(), &auth.User{
+		Username: "dev",
+		Role:     auth.RoleDeveloper,
+		WorkspaceAccess: &auth.WorkspaceAccess{
+			Grants: []auth.WorkspaceGrant{{Workspace: "a", Role: auth.RoleDeveloper}},
+		},
+	})
+
+	// List shows workspace "a" + all-workspace views, hides workspace "b".
+	listResp, err := api.ListViews(devCtx, apigen.ListViewsRequestObject{})
+	require.NoError(t, err)
+	listed, ok := listResp.(apigen.ListViews200JSONResponse)
+	require.True(t, ok)
+	names := map[string]bool{}
+	for _, v := range listed.Views {
+		names[v.Name] = true
+	}
+	assert.True(t, names["A"], "accessible workspace view visible")
+	assert.True(t, names["All"], "all-workspace view visible")
+	assert.False(t, names["B"], "inaccessible workspace view must be hidden")
+
+	// GetView on the inaccessible-workspace view returns 404 (existence hidden).
+	getB, err := api.GetView(devCtx, apigen.GetViewRequestObject{ViewId: viewB.Id})
+	require.NoError(t, err)
+	_, ok = getB.(apigen.GetView404JSONResponse)
+	assert.True(t, ok, "get of inaccessible-workspace view must be 404")
+
+	getA, err := api.GetView(devCtx, apigen.GetViewRequestObject{ViewId: viewA.Id})
+	require.NoError(t, err)
+	_, ok = getA.(apigen.GetView200JSONResponse)
+	assert.True(t, ok, "get of accessible-workspace view must succeed")
+
+	// Creating a view in an inaccessible workspace is denied.
+	_, err = api.CreateView(devCtx, apigen.CreateViewRequestObject{
+		Body: &apigen.ViewSpec{Name: "X", IntervalDays: 1, Workspace: &wsB},
+	})
+	require.Error(t, err, "create in inaccessible workspace must be denied")
+
+	// Deleting the inaccessible-workspace view returns 404.
+	delB, err := api.DeleteView(devCtx, apigen.DeleteViewRequestObject{ViewId: viewB.Id})
+	require.NoError(t, err)
+	_, ok = delB.(apigen.DeleteView404JSONResponse)
+	assert.True(t, ok, "delete of inaccessible-workspace view must be 404")
+}
+
+func TestViewsAPI_ScopedDeveloperCanWriteOwnWorkspace(t *testing.T) {
+	api := newViewsTestAPI(t, apiv1.WithAuthService(stubAuthService{}))
+
+	// A workspace-scoped developer: global VIEWER with a developer grant on "a".
+	ctx := auth.WithUser(context.Background(), &auth.User{
+		Username: "scoped",
+		Role:     auth.RoleViewer,
+		WorkspaceAccess: &auth.WorkspaceAccess{
+			Grants: []auth.WorkspaceGrant{{Workspace: "a", Role: auth.RoleDeveloper}},
+		},
+	})
+	wsA := "a"
+	wsB := "b"
+
+	// Allowed to create in workspace "a" (the grant gives write) - previously
+	// rejected by the global-role check.
+	resp, err := api.CreateView(ctx, apigen.CreateViewRequestObject{
+		Body: &apigen.ViewSpec{Name: "A view", IntervalDays: 1, Workspace: &wsA},
+	})
+	require.NoError(t, err)
+	created, ok := resp.(apigen.CreateView201JSONResponse)
+	require.True(t, ok, "scoped developer must be allowed to write their workspace")
+
+	// Denied in workspace "b" (no grant) and for all-workspace views (governed
+	// by the global viewer role).
+	_, err = api.CreateView(ctx, apigen.CreateViewRequestObject{
+		Body: &apigen.ViewSpec{Name: "B view", IntervalDays: 1, Workspace: &wsB},
+	})
+	require.Error(t, err, "no write access to workspace b")
+	_, err = api.CreateView(ctx, apigen.CreateViewRequestObject{
+		Body: &apigen.ViewSpec{Name: "All view", IntervalDays: 1},
+	})
+	require.Error(t, err, "global viewer cannot write all-workspace views")
+
+	// Allowed to update their own workspace view.
+	updResp, err := api.UpdateView(ctx, apigen.UpdateViewRequestObject{
+		ViewId: apigen.View(created).Id,
+		Body:   &apigen.ViewSpec{Name: "A view 2", IntervalDays: 2, Workspace: &wsA},
+	})
+	require.NoError(t, err)
+	_, ok = updResp.(apigen.UpdateView200JSONResponse)
+	require.True(t, ok, "scoped developer must be allowed to update their workspace view")
+}
+
+func TestViewsAPI_StoreUnavailable(t *testing.T) {
+	// Constructed without WithViewStore: the store is nil.
+	api := apiv1.New(nil, nil, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil)
+	_, err := api.ListViews(context.Background(), apigen.ListViewsRequestObject{})
+	assert.Error(t, err)
+}

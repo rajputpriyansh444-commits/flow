@@ -1,0 +1,800 @@
+package spec023_preconditions_test
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/rajputpriyansh444-commits/flow/conformance/harness"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidatePreconditions(t *testing.T) {
+	t.Parallel()
+
+	validCases := []string{
+		"valid_string_shortcut.yaml",
+		"valid_empty_array.yaml",
+		"valid_missing_command_check.yaml",
+		"valid_eval_value_match.yaml",
+		// An undefined threshold is a notice, not a validation error.
+		"valid_numeric_threshold_undefined.yaml",
+	}
+	for _, file := range validCases {
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", file)
+			result.ExpectExitCode(0)
+			result.ExpectStdout("")
+			result.ExpectStderr("")
+			flow.ExpectNoFile("validate-runtime-ran.txt")
+		})
+	}
+
+	invalidCases := []struct {
+		name        string
+		file        string
+		stderrParts []string
+	}{
+		{
+			name:        "root preconditions object",
+			file:        "invalid_preconditions_object.yaml",
+			stderrParts: []string{"preconditions"},
+		},
+		{
+			name:        "array item scalar",
+			file:        "invalid_array_item_scalar.yaml",
+			stderrParts: []string{"preconditions"},
+		},
+		{
+			name:        "empty string shortcut",
+			file:        "invalid_string_empty.yaml",
+			stderrParts: []string{"preconditions"},
+		},
+		{
+			name:        "missing condition and eval",
+			file:        "invalid_missing_condition.yaml",
+			stderrParts: []string{"preconditions", "condition"},
+		},
+		{
+			name:        "condition and eval",
+			file:        "invalid_condition_and_eval.yaml",
+			stderrParts: []string{"preconditions", "condition", "eval"},
+		},
+		{
+			name:        "empty condition",
+			file:        "invalid_condition_empty.yaml",
+			stderrParts: []string{"preconditions", "condition"},
+		},
+		{
+			name:        "non-string condition",
+			file:        "invalid_condition_non_string.yaml",
+			stderrParts: []string{"preconditions", "condition"},
+		},
+		{
+			name:        "empty eval",
+			file:        "invalid_eval_empty.yaml",
+			stderrParts: []string{"preconditions", "eval"},
+		},
+		{
+			name:        "non-string eval",
+			file:        "invalid_eval_non_string.yaml",
+			stderrParts: []string{"preconditions", "eval"},
+		},
+		{
+			name:        "eval without expected",
+			file:        "invalid_eval_without_expected.yaml",
+			stderrParts: []string{"preconditions", "eval", "expected"},
+		},
+		{
+			name:        "non-string expected",
+			file:        "invalid_expected_non_string.yaml",
+			stderrParts: []string{"preconditions", "expected"},
+		},
+		{
+			name:        "empty expected",
+			file:        "invalid_expected_empty.yaml",
+			stderrParts: []string{"preconditions", "expected"},
+		},
+		{
+			name:        "non-bool negate",
+			file:        "invalid_negate_non_bool.yaml",
+			stderrParts: []string{"preconditions", "negate"},
+		},
+		{
+			name:        "unknown field",
+			file:        "invalid_unknown_field.yaml",
+			stderrParts: []string{"preconditions", "actual"},
+		},
+		{
+			name:        "legacy command field",
+			file:        "invalid_legacy_command.yaml",
+			stderrParts: []string{"preconditions", "command"},
+		},
+		{
+			name:        "invalid regex",
+			file:        "invalid_regex.yaml",
+			stderrParts: []string{"preconditions", "expected", "regexp"},
+		},
+		{
+			name:        "empty regex",
+			file:        "invalid_regex_empty.yaml",
+			stderrParts: []string{"preconditions", "expected", "regexp"},
+		},
+		{
+			name:        "empty numeric comparison",
+			file:        "invalid_numeric_empty.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "unsupported numeric operator",
+			file:        "invalid_numeric_operator.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "non-numeric operand",
+			file:        "invalid_numeric_operand.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+		{
+			name:        "threshold mixes a reference with surrounding text",
+			file:        "invalid_numeric_interpolated_threshold.yaml",
+			stderrParts: []string{"preconditions", "expected", "numeric comparison"},
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("validate", tc.file)
+			result.ExpectNonZeroExitCode()
+			result.ExpectStdout("")
+			result.ExpectStderrContains(tc.stderrParts...)
+		})
+	}
+}
+
+func TestRuntimeValueMatchPreservesCommandSubstitutionUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name    string
+		file    string
+		output  string
+		content string
+		setup   func(*harness.Runner)
+	}{
+		{
+			name:    "dag-level backtick text matches literally",
+			file:    "root_value_match_backtick.yaml",
+			output:  "root-backtick.txt",
+			content: "root\n",
+		},
+		{
+			name:    "step-level backtick text matches literally",
+			file:    "step_value_match_backtick.yaml",
+			output:  "step-backtick.txt",
+			content: "step\n",
+		},
+		{
+			name:    "step-level dollar paren text matches literally",
+			file:    "step_value_match_dollar.yaml",
+			output:  "step-dollar.txt",
+			content: "dollar\n",
+		},
+		{
+			name:    "params eval value can be matched by a precondition",
+			file:    "value_match_params_eval.yaml",
+			output:  "params-eval-precondition.txt",
+			content: "params-eval\n",
+		},
+		{
+			name:    "precondition eval value can be matched directly",
+			file:    "value_match_eval.yaml",
+			output:  "workspace/eval-precondition.txt",
+			content: "eval\n",
+			setup: func(flow *harness.Runner) {
+				flow.Mkdir("workspace")
+				flow.WriteFile("workspace/ready.flag", "")
+			},
+		},
+		{
+			name:    "flow references resolve before matching",
+			file:    "value_match_resolves_refs_first.yaml",
+			output:  "refs-first.txt",
+			content: "refs\n",
+		},
+		{
+			name:    "step value-match expands step env",
+			file:    "value_match_step_context.yaml",
+			output:  "workspace/context-ran.txt",
+			content: "context\n",
+			setup: func(flow *harness.Runner) {
+				flow.Mkdir("workspace")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			if tc.setup != nil {
+				tc.setup(flow)
+			}
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(0)
+			flow.ExpectFileContent(tc.output, tc.content)
+		})
+	}
+}
+
+func TestRuntimeDAGLevelPreconditionStatusEffectsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name        string
+		file        string
+		exitCode    *int
+		nonZero     bool
+		files       map[string]string
+		absentFiles []string
+		setup       func(*harness.Runner)
+	}{
+		{
+			name: "value-match not-met aborts before init and steps",
+			file: "root_value_match_not_met_aborts.yaml",
+			files: map[string]string{
+				"abort-ran.txt": "abort\n",
+			},
+			absentFiles: []string{
+				"init-ran.txt",
+				"failure-ran.txt",
+				"main-ran.txt",
+			},
+		},
+		{
+			name:     "value-match substitution text is not executed before DAG abort",
+			file:     "root_value_match_substitution_literal_aborts.yaml",
+			exitCode: new(int),
+			files: map[string]string{
+				"abort-ran.txt": "abort\n",
+			},
+			absentFiles: []string{
+				"init-ran.txt",
+				"failure-ran.txt",
+				"main-ran.txt",
+				"root-substitution-ran.txt",
+			},
+		},
+		{
+			name: "command-check not-met aborts before init and steps",
+			file: "root_command_check_not_met_aborts.yaml",
+			files: map[string]string{
+				"abort-ran.txt": "abort\n",
+			},
+			absentFiles: []string{
+				"init-ran.txt",
+				"failure-ran.txt",
+				"main-ran.txt",
+			},
+		},
+		{
+			name:     "dag-level value-match expands root env",
+			file:     "root_value_match_context.yaml",
+			exitCode: new(int),
+			files: map[string]string{
+				"rootctx/root-context-ran.txt": "root-context\n",
+			},
+			setup: func(flow *harness.Runner) {
+				flow.Mkdir("rootctx")
+				flow.WriteFile("rootctx/ready.flag", "")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			if tc.setup != nil {
+				tc.setup(flow)
+			}
+			result := flow.Run("start", tc.file)
+			if tc.exitCode != nil {
+				result.ExpectExitCode(*tc.exitCode)
+			}
+			if tc.nonZero {
+				result.ExpectNonZeroExitCode()
+			}
+			for file, content := range tc.files {
+				flow.ExpectFileContent(file, content)
+			}
+			for _, file := range tc.absentFiles {
+				flow.ExpectNoFile(file)
+			}
+		})
+	}
+}
+
+func TestRuntimeCommandCheckPreconditionsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	flow := harness.NewRunner(t)
+	result := flow.Run("start", "command_check_shell_substitution.yaml")
+	result.ExpectExitCode(0)
+	flow.ExpectFileContent("command-check.txt", "command\n")
+}
+
+func TestRuntimeStepLevelPreconditionStatusEffectsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name        string
+		file        string
+		absentFiles []string
+	}{
+		{
+			name: "skipped step blocks dependent step by default",
+			file: "step_skip_blocks_dependent.yaml",
+			absentFiles: []string{
+				"optional-ran.txt",
+				"dependent-ran.txt",
+			},
+		},
+		{
+			name: "skipped step action is not retried or repeated",
+			file: "step_skip_does_not_retry_or_repeat.yaml",
+			absentFiles: []string{
+				"policy-action.txt",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(0)
+			for _, file := range tc.absentFiles {
+				flow.ExpectNoFile(file)
+			}
+		})
+	}
+}
+
+func TestRuntimeNegatedPreconditionsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name       string
+		file       string
+		exitCode   int
+		outputFile string
+		content    string
+		absentFile string
+	}{
+		{
+			name:       "negated value-match mismatch passes",
+			file:       "negate_value_mismatch_runs.yaml",
+			exitCode:   0,
+			outputFile: "negate-value-mismatch.txt",
+			content:    "ran\n",
+		},
+		{
+			name:       "negated value-match match skips",
+			file:       "negate_value_match_skips.yaml",
+			exitCode:   0,
+			absentFile: "negate-value-match.txt",
+		},
+		{
+			name:       "negated command-check failure passes",
+			file:       "negate_command_failure_runs.yaml",
+			exitCode:   0,
+			outputFile: "negate-command-failure.txt",
+			content:    "ran\n",
+		},
+		{
+			name:       "negated command-check success skips",
+			file:       "negate_command_success_skips.yaml",
+			exitCode:   0,
+			absentFile: "negate-command-success.txt",
+		},
+		{
+			name:       "negation does not convert invalid regex into success",
+			file:       "negate_invalid_regex_fails.yaml",
+			exitCode:   1,
+			absentFile: "negate-invalid-regex.txt",
+		},
+		{
+			name:       "negation does not convert a non-numeric value into success",
+			file:       "negate_numeric_not_a_number_fails.yaml",
+			exitCode:   1,
+			absentFile: "negate-numeric-not-a-number.txt",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(tc.exitCode)
+			if tc.outputFile != "" {
+				flow.ExpectFileContent(tc.outputFile, tc.content)
+			}
+			if tc.absentFile != "" {
+				flow.ExpectNoFile(tc.absentFile)
+			}
+		})
+	}
+}
+
+func TestRuntimeMultiplePreconditionsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses POSIX shell snippets")
+	}
+
+	flow := harness.NewRunner(t)
+	result := flow.Run("start", "multiple_conditions_source_order.yaml")
+	result.ExpectExitCode(0)
+	flow.ExpectFileContent("condition-order.txt", "12")
+	flow.ExpectNoFile("multiple-conditions-ran.txt")
+}
+
+func TestRuntimeCommandCheckDetailsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	t.Run("stdout and stderr are ignored", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "command_check_streams_ignored.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectFileContent("command-check-stdout.txt", "action-out\n")
+		flow.ExpectFileContent("command-check-stderr.txt", "action-err\n")
+	})
+
+	t.Run("missing executable is not met and skips step", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		result := flow.Run("start", "command_check_missing_command_skips.yaml")
+		result.ExpectExitCode(0)
+		flow.ExpectNoFile("missing-command-ran.txt")
+	})
+
+	// A command check cut short by the workflow timeout is an interruption,
+	// not a not-met result: the gated step does not run, nothing is skipped,
+	// and the run fails as any workflow timeout does.
+	for _, tc := range []struct {
+		name string
+		file string
+	}{
+		{name: "timeout interrupts step command check", file: "command_check_timeout.yaml"},
+		{name: "timeout interrupts DAG command check", file: "dag_command_check_timeout.yaml"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			env := []string{"FLOW_HOME=" + filepath.Join(t.TempDir(), "flow")}
+			const runID = "spec023-condition-timeout"
+
+			result := flow.RunWithEnv(env, "start", "--run-id="+runID, tc.file)
+			result.ExpectNonZeroExitCode()
+			flow.ExpectNoFile("timeout-ran.txt")
+
+			status := flow.RunWithEnv(env, "status", "--run-id="+runID, tc.file)
+			status.ExpectExitCode(0)
+			require.Contains(t, status.Stdout(), "Result: Failed")
+			require.NotContains(t, status.Stdout(), "[skipped]")
+		})
+	}
+
+	// Stopping the run interrupts a running command check: the run aborts
+	// without waiting for the check, and the gated step neither runs nor is
+	// skipped.
+	t.Run("stop interrupts command check", func(t *testing.T) {
+		t.Parallel()
+
+		flow := harness.NewRunner(t)
+		env := []string{"FLOW_HOME=" + filepath.Join(t.TempDir(), "flow")}
+		const (
+			runID = "spec023-condition-stop"
+			file  = "command_check_stop.yaml"
+		)
+
+		proc := flow.StartWithEnv(env, "start", "--run-id="+runID, file)
+
+		deadline := time.Now().Add(harness.WaitTimeout(t))
+		for {
+			// Redirection creates the file before printf writes the marker.
+			content, err := os.ReadFile(flow.ProjectPath("check-started.txt"))
+			if err == nil && string(content) == "started\n" {
+				break
+			}
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("reading start marker: %v", err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("command check never started: %s", proc.FailureOutput())
+			}
+			select {
+			case <-proc.Done():
+				t.Fatalf("flow start exited before the command check started: %s", proc.FailureOutput())
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		stopResult := flow.RunWithEnv(env, "stop", "--run-id="+runID, file)
+		stopResult.ExpectExitCode(0)
+
+		// The check sleeps longer than this wait, so only an interrupted check
+		// lets the run end in time.
+		select {
+		case <-proc.Done():
+		case <-time.After(harness.WaitTimeout(t)):
+			t.Fatal("flow start did not exit after flow stop returned")
+		}
+		flow.ExpectNoFile("stop-ran.txt")
+
+		status := flow.RunWithEnv(env, "status", "--run-id="+runID, file)
+		status.ExpectExitCode(0)
+		require.Contains(t, status.Stdout(), "Result: Aborted")
+		require.NotContains(t, status.Stdout(), "[skipped]")
+	})
+}
+
+func TestRuntimeValueMatchDetailsUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name       string
+		file       string
+		outputFile string
+		content    string
+		absentFile string
+	}{
+		{
+			name:       "expected is literal and not value-resolved",
+			file:       "expected_literal_not_resolved.yaml",
+			absentFile: "expected-literal-ran.txt",
+		},
+		{
+			name:       "expected does not run command substitution",
+			file:       "expected_command_substitution_literal.yaml",
+			absentFile: "expected-substitution-ran.txt",
+		},
+		{
+			name:       "unqualified env variables resolve before matching",
+			file:       "value_match_env_var_resolves.yaml",
+			outputFile: "env-var-resolves-ran.txt",
+			content:    "ran\n",
+		},
+		{
+			name:       "command substitution text is matched literally",
+			file:       "value_match_substitution_literal_runs.yaml",
+			outputFile: "substitution-literal.txt",
+			content:    "ran\n",
+			absentFile: "value-match-substitution-ran.txt",
+		},
+		{
+			name:       "literal expected matches one condition line",
+			file:       "value_match_line_match.yaml",
+			outputFile: "line-match-ran.txt",
+			content:    "ran\n",
+		},
+		{
+			name:       "regex matching is case-sensitive",
+			file:       "regex_case_sensitive.yaml",
+			absentFile: "regex-case-ran.txt",
+		},
+		{
+			name:       "regex matching is not implicitly anchored",
+			file:       "regex_unanchored.yaml",
+			outputFile: "regex-unanchored-ran.txt",
+			content:    "ran\n",
+		},
+		{
+			name:       "step managed env resolves before matching",
+			file:       "step_managed_env_value_match.yaml",
+			outputFile: "managed-env.txt",
+			content:    "managed-env\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(0)
+			if tc.outputFile != "" {
+				flow.ExpectFileContent(tc.outputFile, tc.content)
+			}
+			if tc.absentFile != "" {
+				flow.ExpectNoFile(tc.absentFile)
+			}
+		})
+	}
+}
+
+func TestRuntimePreconditionOutcomesUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name        string
+		file        string
+		exitCode    int
+		absentFiles []string
+	}{
+		{
+			name:        "value-match mismatch skips step without running action",
+			file:        "value_match_not_met_skips.yaml",
+			exitCode:    0,
+			absentFiles: []string{"not-met-ran.txt"},
+		},
+		{
+			name:        "value-match substitution text mismatch skips step without executing it",
+			file:        "value_match_substitution_literal_skips.yaml",
+			exitCode:    0,
+			absentFiles: []string{"failure-ran.txt", "step-substitution-ran.txt"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(tc.exitCode)
+			for _, file := range tc.absentFiles {
+				flow.ExpectNoFile(file)
+			}
+		})
+	}
+}
+
+// A num: comparison that does not hold skips the step, but a value that is not
+// a number fails it, so that a numeric gate cannot silently stop gating.
+func TestRuntimeNumericValueMatchUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures use POSIX shell snippets")
+	}
+
+	cases := []struct {
+		name       string
+		file       string
+		exitCode   int
+		outputFile string
+		absentFile string
+	}{
+		{
+			name:       "comparison holds and the step runs",
+			file:       "value_match_numeric_met.yaml",
+			exitCode:   0,
+			outputFile: "numeric-met-ran.txt",
+		},
+		{
+			name:       "comparison does not hold and the step is skipped",
+			file:       "value_match_numeric_not_met.yaml",
+			exitCode:   0,
+			absentFile: "numeric-not-met-ran.txt",
+		},
+		{
+			name:       "a value that is not a number fails the step",
+			file:       "value_match_numeric_not_a_number.yaml",
+			exitCode:   1,
+			absentFile: "numeric-not-a-number-ran.txt",
+		},
+		{
+			// Numeric matching is not line-based, so no line is considered on
+			// its own and the multi-line value is simply not a number.
+			name:       "a multi-line value fails the step",
+			file:       "value_match_numeric_multiline.yaml",
+			exitCode:   1,
+			absentFile: "numeric-multiline-ran.txt",
+		},
+		{
+			name:       "a threshold can come from a param",
+			file:       "value_match_numeric_threshold_reference.yaml",
+			exitCode:   0,
+			outputFile: "numeric-threshold-ran.txt",
+		},
+		{
+			name:       "a threshold can come from a scoped reference",
+			file:       "value_match_numeric_threshold_scoped.yaml",
+			exitCode:   0,
+			outputFile: "numeric-threshold-scoped-ran.txt",
+		},
+		{
+			name:       "a referenced threshold that is not met skips the step",
+			file:       "value_match_numeric_threshold_not_met.yaml",
+			exitCode:   0,
+			absentFile: "numeric-threshold-not-met-ran.txt",
+		},
+		{
+			name:       "a threshold that does not resolve to a number fails the step",
+			file:       "value_match_numeric_threshold_not_a_number.yaml",
+			exitCode:   1,
+			absentFile: "numeric-threshold-bad-ran.txt",
+		},
+		{
+			// A later not-met condition must not downgrade the numeric
+			// evaluation error into a skip.
+			name:       "an evaluation error outranks a later not-met condition",
+			file:       "numeric_error_outranks_not_met.yaml",
+			exitCode:   1,
+			absentFile: "numeric-error-outranks-ran.txt",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			flow := harness.NewRunner(t)
+			result := flow.Run("start", tc.file)
+			result.ExpectExitCode(tc.exitCode)
+			if tc.outputFile != "" {
+				flow.ExpectFileContent(tc.outputFile, "ran\n")
+			}
+			if tc.absentFile != "" {
+				flow.ExpectNoFile(tc.absentFile)
+			}
+		})
+	}
+}
+
+func TestValidateDoesNotExecutePreconditionCommandSubstitutionUnix(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses POSIX shell snippets")
+	}
+
+	flow := harness.NewRunner(t)
+	result := flow.Run("validate", "validate_does_not_execute.yaml")
+	result.ExpectExitCode(0)
+	result.ExpectStdout("")
+	flow.ExpectNoFile("validate-substitution-ran.txt")
+	flow.ExpectNoFile("validate-eval-ran.txt")
+	flow.ExpectNoFile("validate-runtime-ran.txt")
+}

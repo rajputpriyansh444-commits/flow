@@ -1,0 +1,6 @@
+secrets:
+  - name: FLOW_FOO
+    provider: env
+    key: X
+steps:
+  - command: echo hi

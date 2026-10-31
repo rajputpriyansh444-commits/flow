@@ -1,0 +1,1094 @@
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/dirlock"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/logger/tag"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/signalctx"
+	"github.com/rajputpriyansh444-commits/flow/internal/dagrun"
+	"github.com/rajputpriyansh444-commits/flow/internal/dagsettings"
+	"github.com/rajputpriyansh444-commits/flow/internal/dispatch"
+	"github.com/rajputpriyansh444-commits/flow/internal/eventstore"
+	"github.com/rajputpriyansh444-commits/flow/internal/incident"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/launcher"
+	"github.com/rajputpriyansh444-commits/flow/internal/license"
+	"github.com/rajputpriyansh444-commits/flow/internal/notification"
+	"github.com/rajputpriyansh444-commits/flow/internal/opencodehost"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+	persisfile "github.com/rajputpriyansh444-commits/flow/internal/persis/file"
+	"github.com/rajputpriyansh444-commits/flow/internal/proc"
+	"github.com/rajputpriyansh444-commits/flow/internal/profile"
+	"github.com/rajputpriyansh444-commits/flow/internal/publicwebhook"
+	queuedomain "github.com/rajputpriyansh444-commits/flow/internal/queue"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime"
+	"github.com/rajputpriyansh444-commits/flow/internal/schedulerstate"
+	"github.com/rajputpriyansh444-commits/flow/internal/service/chatbridge"
+	"github.com/rajputpriyansh444-commits/flow/internal/serviceregistry"
+	"github.com/rajputpriyansh444-commits/flow/internal/workspace"
+)
+
+// Clock is a function that returns the current time.
+// It can be replaced for testing purposes.
+type Clock func() time.Time
+
+type processRepository interface {
+	queueProcessRepository
+	zombieProcessRepository
+	queuedomain.RunProcesses
+	CountAliveByDAGName(ctx context.Context, groupName, dagName string) (int, error)
+}
+
+type queueProcessRepository interface {
+	CountAlive(ctx context.Context, groupName string) (int, error)
+	IsRunAlive(ctx context.Context, groupName string, dagRun ir.DAGRunRef) (bool, error)
+}
+
+type zombieProcessRepository interface {
+	ListAllEntries(ctx context.Context) ([]proc.ProcEntry, error)
+	RemoveIfStale(ctx context.Context, entry proc.ProcEntry) error
+}
+
+type Scheduler struct {
+	entryReader         EntryReader
+	quit                chan any
+	running             atomic.Bool
+	dagRepository       *persis.DAGRepository
+	dagRunRepository    *persis.DAGRunRepository
+	queueStore          queuedomain.QueueStore
+	procRepository      processRepository
+	config              *config.Config
+	dirLock             dirlock.DirLock // File-based lock to prevent multiple scheduler instances
+	dagExecutor         *DAGExecutor
+	healthServer        *HealthServer // Health check server for monitoring
+	serviceRegistry     serviceregistry.ServiceRegistry
+	disableHealthServer bool            // Disable health server when running from start-all
+	disableSignals      bool            // Leave OS signals to start-all
+	zombieDetector      *ZombieDetector // Zombie DAG run detector
+	instanceID          string          // Unique instance identifier for service registry
+	queueProcessor      *QueueProcessor // Processor for queued DAG runs
+	queueWatcher        queuedomain.QueueWatcher
+	retryScanner        *RetryScanner // DAG-level retry scanner
+	planner             *TickPlanner  // Unified scheduling decision module
+	stopOnce            sync.Once
+	lock                sync.Mutex
+	lifecycleMu         sync.Mutex
+	startupCancel       context.CancelFunc
+	lockHeld            atomic.Bool
+	clock               Clock    // Clock function for getting current time
+	wakeHold            wakeHold // The hold on the ticks after the host wakes (wake_hold.go)
+	eventCollector      func(context.Context)
+	notificationMonitor *chatbridge.NotificationMonitor
+	incidentMonitor     *chatbridge.NotificationMonitor
+	publicWebhooks      *publicwebhook.Service
+	folderWatcher       *folderWatcher // Starts runs for files arriving in watched folders
+}
+
+type schedulerHooks struct {
+	onLockWait func()
+}
+
+// Dependencies contains the stores and services used by Scheduler.
+type Dependencies struct {
+	EntryReader          EntryReader
+	DAGRunManager        runtime.Manager
+	DAGRepository        *persis.DAGRepository
+	DAGRunRepository     *persis.DAGRunRepository
+	QueueStore           queuedomain.QueueStore
+	ProcRepository       *persis.ProcRepository
+	ServiceRegistry      serviceregistry.ServiceRegistry
+	CoordinatorClient    dispatch.Dispatcher
+	SchedulerStateStore  schedulerstate.Store
+	SchedulerPauseStore  schedulerstate.PauseStore
+	DAGRunLeaseStore     dispatch.DAGRunLeaseStore
+	DispatchTaskStore    dispatch.DispatchTaskStore
+	WorkerHeartbeatStore dispatch.WorkerHeartbeatStore
+	WorkerStaleAfter     time.Duration
+	DAGSettingsStore     dagsettings.Store
+	ProfileStore         profile.Store
+	EventService         *eventstore.Service
+	EventCollector       func(context.Context)
+	NotificationStore    notification.Store
+	NotificationState    chatbridge.StateStore
+	NewNotificationLease func() chatbridge.Lease
+	IncidentStore        incident.Store
+	IncidentState        chatbridge.StateStore
+	NewIncidentLease     func() chatbridge.Lease
+	LicenseManager       *license.Manager
+	// Webhooks, PublicWebhookStore, and CloudCredentials enable public
+	// webhook URLs; the feature is off unless all are set.
+	Webhooks           publicwebhook.Webhooks
+	PublicWebhookStore publicwebhook.Store
+	CloudCredentials   func() (license.CloudCredentials, bool)
+	// WatchStore remembers the files watched folders held across restarts;
+	// nil remembers them for the process only.
+	WatchStore schedulerstate.WatchStore
+}
+
+type startupState struct {
+	serviceRegistered      bool
+	lockAcquired           bool
+	healthServerStarted    bool
+	queueWatcherStarted    bool
+	queueProcessorStarted  bool
+	entryReaderInitialized bool
+	plannerStarted         bool
+}
+
+// New constructs a Scheduler from its configuration and dependencies.
+func New(cfg *config.Config, deps Dependencies) (*Scheduler, error) {
+	var profileResolver DAGProfileResolver
+	if deps.DAGSettingsStore != nil {
+		profileResolver = NewDAGProfileResolver(deps.DAGSettingsStore, deps.ProfileStore)
+	}
+	scheduler, err := newScheduler(
+		cfg,
+		deps.EntryReader,
+		deps.DAGRunManager,
+		deps.DAGRepository,
+		deps.DAGRunRepository,
+		deps.QueueStore,
+		deps.ProcRepository,
+		deps.ServiceRegistry,
+		deps.CoordinatorClient,
+		deps.SchedulerStateStore,
+		deps.SchedulerPauseStore,
+		schedulerHooks{},
+		profileResolver,
+	)
+	if err != nil {
+		return nil, err
+	}
+	scheduler.eventCollector = deps.EventCollector
+	if deps.EventService != nil {
+		scheduler.notificationMonitor = newNotificationMonitor(cfg, deps)
+		scheduler.incidentMonitor = newIncidentMonitor(cfg, deps)
+	}
+	scheduler.publicWebhooks = newPublicWebhooks(cfg, deps, scheduler)
+	scheduler.folderWatcher.cfg.Store = deps.WatchStore
+	scheduler.queueProcessor.dagRunLeaseStore = deps.DAGRunLeaseStore
+	scheduler.queueProcessor.dispatchTaskStore = deps.DispatchTaskStore
+	scheduler.queueProcessor.dispatchAdmissionStore = dispatchAdmissionStoreFromTaskStore(deps.DispatchTaskStore)
+	scheduler.queueProcessor.workerHeartbeatStore = deps.WorkerHeartbeatStore
+	if deps.WorkerStaleAfter != 0 {
+		scheduler.queueProcessor.workerStaleAfter = deps.WorkerStaleAfter
+	}
+	return scheduler, nil
+}
+
+func newScheduler(
+	cfg *config.Config,
+	er EntryReader,
+	drm runtime.Manager,
+	dagRepository *persis.DAGRepository,
+	dagRunRepository *persis.DAGRunRepository,
+	queueStore queuedomain.QueueStore,
+	procRepository processRepository,
+	reg serviceregistry.ServiceRegistry,
+	coordinatorCli dispatch.Dispatcher,
+	stateStore schedulerstate.Store,
+	pauseStore schedulerstate.PauseStore,
+	hooks schedulerHooks,
+	profileResolver DAGProfileResolver,
+) (*Scheduler, error) {
+	if dagRepository == nil {
+		return nil, fmt.Errorf("DAG repository is required")
+	}
+	if dagRunRepository == nil {
+		return nil, fmt.Errorf("DAG-run repository is required")
+	}
+	if er == nil {
+		return nil, fmt.Errorf("DAG entry reader is required")
+	}
+	timeLoc := cfg.Core.Location
+	if timeLoc == nil {
+		timeLoc = time.Local
+	}
+	lockOpts := &dirlock.LockOptions{
+		StaleThreshold: cfg.Scheduler.LockStaleThreshold,
+		RetryInterval:  cfg.Scheduler.LockRetryInterval,
+		OnWait:         hooks.onLockWait,
+	}
+	lockDir := filepath.Join(persisfile.SchedulerStateDir(cfg.Paths), "locks")
+	dirLock := dirlock.New(lockDir, lockOpts)
+	subCmdBuilder := launcher.NewSubCmdBuilder(cfg)
+	workspaceBaseConfigDir := workspace.BaseConfigDir(cfg.Paths.DAGsDir)
+	dagExecutor := NewDAGExecutor(
+		coordinatorCli,
+		subCmdBuilder,
+		cfg.DefaultExecMode,
+		cfg.Paths.BaseConfig,
+		WithDAGExecutorProfileResolver(profileResolver),
+		WithDAGExecutorWorkspaceBaseConfigDir(workspaceBaseConfigDir),
+	)
+	healthServer := NewHealthServer(cfg.Scheduler.Port)
+
+	// Resolve IsSuspended once at construction time.
+	eventCh := er.Events()
+	isSuspended := newSuspensionChecker(pauseStore, dagRepository.IsSuspended)
+	processor := NewQueueProcessor(
+		queueStore,
+		dagRunRepository,
+		procRepository,
+		dagExecutor,
+		cfg.Queues,
+		WithIsSuspended(isSuspended),
+	)
+	defaultClock := Clock(time.Now)
+
+	// Build catchup-enqueue callbacks when queues are enabled.
+	queuesEnabled := cfg.Queues.Enabled
+	var isQueued IsQueuedFunc
+	var enqueueFunc EnqueueFunc
+	if queuesEnabled {
+		isQueued = func(ctx context.Context, dag *ir.DAG) (bool, error) {
+			items, err := queueStore.ListByDAGName(ctx, dag.ProcGroup(), dag.Name)
+			if err != nil {
+				return false, err
+			}
+			return len(items) > 0, nil
+		}
+		enqueueFunc = func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error {
+			dag := entry.DAG
+			profileName, err := dagExecutor.defaultProfileName(ctx, entry.DefinitionID, dag)
+			if err != nil {
+				return fmt.Errorf("failed to resolve DAG profile: %w", err)
+			}
+			return EnqueueCatchupRun(
+				ctx,
+				dagRunRepository,
+				queueStore,
+				cfg.Paths.LogDir,
+				cfg.Paths.ArtifactDir,
+				cfg.Paths.BaseConfig,
+				workspaceBaseConfigDir,
+				entry.DefinitionID,
+				dag,
+				runID,
+				triggerType,
+				scheduleTime,
+				profileName,
+			)
+		}
+	}
+
+	planner := NewTickPlanner(TickPlannerConfig{
+		StateStore:      stateStore,
+		IsSuspended:     isSuspended,
+		GetLatestStatus: drm.GetLatestStatus,
+		IsRunning: func(ctx context.Context, dag *ir.DAG) (bool, error) {
+			count, err := procRepository.CountAliveByDAGName(ctx, dag.ProcGroup(), dag.Name)
+			if err != nil {
+				return false, err
+			}
+			return count > 0, nil
+		},
+		GenRunID: func(context.Context) (string, error) {
+			return ir.NewDAGRunID()
+		},
+		Dispatch: func(ctx context.Context, entry DAGEntry, runID string, triggerType ir.TriggerType, scheduleTime time.Time) error {
+			return dagExecutor.HandleJob(
+				ctx, entry,
+				dispatch.DispatchOperationStart,
+				runID, triggerType, scheduleTime,
+			)
+		},
+		Stop: func(ctx context.Context, dag *ir.DAG) error {
+			return drm.Stop(ctx, dag, "")
+		},
+		Restart: func(ctx context.Context, entry DAGEntry, scheduleTime time.Time) error {
+			return dagExecutor.Restart(ctx, entry, scheduleTime)
+		},
+		Clock:           defaultClock,
+		Location:        timeLoc,
+		Events:          eventCh,
+		ProfileResolver: profileResolver,
+		QueuesEnabled:   queuesEnabled,
+		Enqueue:         enqueueFunc,
+		HasGlobalQueue: func(dag *ir.DAG) bool {
+			return cfg.FindQueueConfig(dag.ProcGroup()) != nil
+		},
+		IsQueued: isQueued,
+		RunExists: func(ctx context.Context, dag *ir.DAG, runID string) (bool, error) {
+			_, err := dagRunRepository.FindAttempt(ctx, ir.NewDAGRunRef(dag.Name, runID))
+			switch {
+			case err == nil:
+				return true, nil
+			case errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+				return false, nil
+			case errors.Is(err, dagrun.ErrNoStatusData):
+				return true, nil
+			default:
+				return false, err
+			}
+		},
+	})
+
+	retryScanner, err := NewRetryScanner(
+		dagRunRepository,
+		queueStore,
+		isSuspended,
+		cfg.Scheduler.RetryFailureWindow,
+		defaultClock,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize retry scanner: %w", err)
+	}
+	retryScanner.processes = procRepository
+
+	s := &Scheduler{
+		quit:             make(chan any),
+		entryReader:      er,
+		dagRepository:    dagRepository,
+		dagRunRepository: dagRunRepository,
+		queueStore:       queueStore,
+		procRepository:   procRepository,
+		config:           cfg,
+		dirLock:          dirLock,
+		dagExecutor:      dagExecutor,
+		healthServer:     healthServer,
+		serviceRegistry:  reg,
+		queueProcessor:   processor,
+		retryScanner:     retryScanner,
+		planner:          planner,
+		clock:            defaultClock,
+		wakeHold:         newWakeHold(cfg.Scheduler.WakeHold, pauseStore),
+	}
+	s.folderWatcher = newFolderWatcher(folderWatcherConfig{
+		Entries:     er.Entries,
+		IsSuspended: isSuspended,
+		Enqueue:     s.enqueueFileRun,
+		Clock:       func() time.Time { return s.clock() },
+	})
+	return s, nil
+}
+
+// SetClock sets a custom clock function for testing purposes.
+// This must be called before Start().
+func (s *Scheduler) SetClock(clock Clock) {
+	s.clock = clock
+	s.planner.cfg.Clock = clock
+	if s.retryScanner != nil {
+		s.retryScanner.clock = clock
+	}
+}
+
+// SetRestartFunc overrides the planner's restart function for testing purposes.
+// This must be called before Start().
+func (s *Scheduler) SetRestartFunc(fn RestartFunc) {
+	s.planner.cfg.Restart = fn
+}
+
+// SetStopFunc overrides the planner's stop function for testing purposes.
+// This must be called before Start().
+func (s *Scheduler) SetStopFunc(fn StopFunc) {
+	s.planner.cfg.Stop = fn
+}
+
+// SetGetLatestStatusFunc overrides the planner's GetLatestStatus function for testing purposes.
+// This must be called before Start().
+func (s *Scheduler) SetGetLatestStatusFunc(fn GetLatestStatusFunc) {
+	s.planner.cfg.GetLatestStatus = fn
+}
+
+// SetDispatchFunc overrides the planner's Dispatch function for testing purposes.
+// This must be called before Start().
+func (s *Scheduler) SetDispatchFunc(fn DispatchFunc) {
+	s.planner.cfg.Dispatch = fn
+}
+
+// DisableHealthServer disables the health check server (used when running from start-all)
+func (s *Scheduler) DisableHealthServer() {
+	s.disableHealthServer = true
+}
+
+// DisableSignalHandling leaves OS signals to the hosting process, which stops
+// the scheduler through its context and Stop instead.
+func (s *Scheduler) DisableSignalHandling() {
+	s.disableSignals = true
+}
+
+// SetOpenCodeHost enables the process-owned managed OpenCode service.
+func (s *Scheduler) SetOpenCodeHost(host *opencodehost.Host) {
+	s.dagExecutor.openCodeHost = host
+}
+
+func (s *Scheduler) registerStartupCancel(cancel context.CancelFunc) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	select {
+	case <-s.quit:
+		return false
+	default:
+	}
+
+	s.startupCancel = cancel
+	return true
+}
+
+func (s *Scheduler) clearStartupCancel() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	s.startupCancel = nil
+}
+
+func (s *Scheduler) stopping() bool {
+	select {
+	case <-s.quit:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Scheduler) releaseDirLock(ctx context.Context, msg string) {
+	if !s.lockHeld.CompareAndSwap(true, false) {
+		return
+	}
+	if err := s.dirLock.Unlock(); err != nil {
+		logger.Error(ctx, msg, tag.Error(err))
+	}
+}
+
+func (s *Scheduler) beginStartup(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	startupCtx, cancel := context.WithCancel(ctx)
+	if !s.registerStartupCancel(cancel) {
+		cancel()
+		return nil, nil, false
+	}
+	return startupCtx, cancel, true
+}
+
+func (s *Scheduler) cleanupFailedStartup(state startupState) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+
+	if state.queueWatcherStarted {
+		s.stopQueueWatcher(cleanupCtx)
+	}
+	if state.queueProcessorStarted {
+		s.queueProcessor.Stop()
+	}
+	if state.entryReaderInitialized {
+		s.entryReader.Stop()
+	}
+	if state.plannerStarted {
+		s.planner.Stop(cleanupCtx)
+	}
+	if state.healthServerStarted {
+		s.stopHealthServer(cleanupCtx, "Failed to stop health check server during startup cleanup")
+	}
+	s.closeDAGExecutor(cleanupCtx)
+	if state.serviceRegistered {
+		s.unregisterService(cleanupCtx)
+	}
+	if state.lockAcquired {
+		s.releaseDirLock(cleanupCtx, "Failed to release scheduler lock during startup cleanup")
+	}
+}
+
+func (s *Scheduler) updateServiceStatus(ctx context.Context, status serviceregistry.ServiceStatus, failureMsg, successMsg string) {
+	if s.serviceRegistry == nil {
+		return
+	}
+	if err := s.serviceRegistry.UpdateStatus(ctx, serviceregistry.ServiceNameScheduler, status); err != nil {
+		logger.Error(ctx, failureMsg, tag.Error(err))
+		return
+	}
+	if successMsg != "" {
+		logger.Info(ctx, successMsg)
+	}
+}
+
+func (s *Scheduler) stopHealthServer(ctx context.Context, failureMsg string) {
+	if s.healthServer == nil || s.disableHealthServer {
+		return
+	}
+	if err := s.healthServer.Stop(ctx); err != nil {
+		logger.Error(ctx, failureMsg, tag.Error(err))
+	}
+}
+
+func (s *Scheduler) closeDAGExecutor(ctx context.Context) {
+	if s.dagExecutor != nil {
+		s.dagExecutor.Close(ctx)
+	}
+}
+
+func (s *Scheduler) setQueueWatcher(w queuedomain.QueueWatcher) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.queueWatcher = w
+}
+
+func (s *Scheduler) stopQueueWatcher(ctx context.Context) {
+	s.lock.Lock()
+	queueWatcher := s.queueWatcher
+	s.queueWatcher = nil
+	s.lock.Unlock()
+
+	if queueWatcher != nil {
+		queueWatcher.Stop(ctx)
+	}
+}
+
+func (s *Scheduler) unregisterService(ctx context.Context) {
+	if s.serviceRegistry != nil {
+		s.serviceRegistry.Unregister(ctx)
+	}
+}
+
+func (s *Scheduler) Start(ctx context.Context) error {
+	ctx, cancel, ok := s.beginStartup(ctx)
+	if !ok {
+		return nil
+	}
+	state := startupState{}
+	cleanupOnFailure := true
+	defer func() {
+		if !cleanupOnFailure {
+			return
+		}
+		s.cleanupFailedStartup(state)
+	}()
+	defer func() {
+		s.clearStartupCancel()
+		cancel()
+	}()
+
+	if s.instanceID == "" {
+		hostname, _ := os.Hostname()
+		s.instanceID = fmt.Sprintf("%s-%d-%d", hostname, os.Getpid(), time.Now().Unix())
+	}
+
+	if s.serviceRegistry != nil {
+		hostname, _ := os.Hostname()
+		hostInfo := serviceregistry.HostInfo{
+			ID:        s.instanceID,
+			Host:      hostname,
+			Port:      s.config.Scheduler.Port, // Health check port (0 if disabled)
+			Status:    serviceregistry.ServiceStatusInactive,
+			StartedAt: time.Now(),
+		}
+		if err := s.serviceRegistry.Register(ctx, serviceregistry.ServiceNameScheduler, hostInfo); err != nil {
+			logger.Error(ctx, "Failed to register with service registry", tag.Error(err))
+			// Continue anyway - service registry is not critical
+		} else {
+			state.serviceRegistered = true
+			logger.Info(ctx, "Registered with service registry as inactive",
+				tag.ServiceID(s.instanceID),
+				tag.Host(hostname),
+				tag.Port(s.config.Scheduler.Port),
+			)
+		}
+	}
+
+	// Every scheduler process should expose /health, even while it is waiting
+	// on the HA lock. Active/inactive role is tracked separately via the
+	// service registry status.
+	if !s.disableHealthServer {
+		if err := s.healthServer.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start health check server: %w", err)
+		}
+		state.healthServerStarted = true
+	}
+
+	logger.Info(ctx, "Waiting to acquire scheduler lock")
+	if err := s.dirLock.Lock(ctx); err != nil {
+		if errors.Is(err, context.Canceled) && s.stopping() {
+			return nil
+		}
+		return fmt.Errorf("failed to acquire scheduler lock: %w", err)
+	}
+	s.lockHeld.Store(true)
+	state.lockAcquired = true
+
+	logger.Info(ctx, "Acquired scheduler lock")
+
+	if ctx.Err() != nil && s.stopping() {
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		s.startHeartbeat(ctx)
+	})
+
+	if err := s.dagRepository.MigrateSuspensionState(ctx); err != nil {
+		if errors.Is(err, context.Canceled) && s.stopping() {
+			return nil
+		}
+		return fmt.Errorf("migrate suspension state: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		if s.stopping() {
+			return nil
+		}
+		return err
+	}
+
+	s.updateServiceStatus(ctx, serviceregistry.ServiceStatusActive, "Failed to update status to active", "Updated scheduler status to active")
+	if err := s.BootstrapMonitors(ctx); err != nil {
+		return err
+	}
+
+	sig := make(chan os.Signal, 1)
+
+	queueWatcher := s.queueStore.QueueWatcher(ctx)
+	notifyCh, err := queueWatcher.Start(ctx)
+	if err != nil {
+		logger.Error(ctx, "Failed to start queue watcher", tag.Error(err))
+		return err
+	}
+	s.setQueueWatcher(queueWatcher)
+	state.queueWatcherStarted = true
+	s.queueProcessor.Start(ctx, notifyCh)
+	state.queueProcessorStarted = true
+
+	if !s.disableSignals {
+		signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+		defer signal.Stop(sig)
+	}
+
+	if err := s.entryReader.Init(ctx); err != nil {
+		logger.Error(ctx, "Failed to initialize entry reader", tag.Error(err))
+		return err
+	}
+	state.entryReaderInitialized = true
+
+	// planner.Init is best-effort: if watermark loading fails, Init falls back
+	// to an empty state internally, so catch-up windows replay from scratch.
+	if err := s.planner.Init(ctx, s.entryReader.Entries()); err != nil {
+		logger.Error(ctx, "Failed to initialize tick planner", tag.Error(err))
+	}
+
+	s.planner.Start(ctx)
+	state.plannerStarted = true
+
+	// Start background loops only after the last startup failure point.
+	// Heartbeat starts earlier to keep the scheduler lock alive during init.
+	wg.Go(func() {
+		s.startZombieDetector(ctx)
+	})
+
+	wg.Go(func() {
+		s.startRetryScanner(ctx)
+	})
+
+	wg.Go(func() {
+		s.startEventCollector(ctx)
+	})
+
+	wg.Go(func() {
+		s.startNotificationMonitor(ctx)
+	})
+
+	wg.Go(func() {
+		s.startIncidentMonitor(ctx)
+	})
+
+	wg.Go(func() {
+		s.startPublicWebhooks(ctx)
+	})
+
+	wg.Go(func() {
+		s.folderWatcher.Start(ctx)
+	})
+
+	wg.Go(func() {
+		s.entryReader.Start(ctx)
+	})
+
+	// A hold a previous process left behind would pause this one for nobody.
+	s.wakeHold.clearStale(ctx)
+
+	logger.Info(ctx, "Scheduler started")
+	cleanupOnFailure = false
+
+	wg.Add(1)
+	go func(ctx context.Context) {
+		defer wg.Done()
+		s.cronLoop(ctx, sig)
+	}(ctx)
+	wg.Wait()
+
+	return nil
+}
+
+func (s *Scheduler) startZombieDetector(ctx context.Context) {
+	if s.config.Scheduler.ZombieDetectionInterval <= 0 {
+		return
+	}
+
+	// Create zombie detector while holding lock. Check s.quit first to
+	// avoid starting after Stop() has already run. Both this check and
+	// Stop()'s close(s.quit) + zombieDetector.Stop() happen under s.lock,
+	// so there is no race.
+	s.lock.Lock()
+	select {
+	case <-s.quit:
+		s.lock.Unlock()
+		return
+	case <-ctx.Done():
+		s.lock.Unlock()
+		return
+	default:
+	}
+	s.zombieDetector = NewZombieDetector(
+		s.dagRunRepository,
+		s.procRepository,
+		s.config.Scheduler.ZombieDetectionInterval,
+		s.config.Scheduler.FailureThreshold,
+	)
+	zd := s.zombieDetector
+	s.lock.Unlock()
+
+	logger.Info(ctx, "Started zombie detector",
+		tag.Interval(s.config.Scheduler.ZombieDetectionInterval),
+	)
+
+	// Start blocks, so call it after releasing the lock
+	zd.Start(ctx)
+}
+
+func (s *Scheduler) startEventCollector(ctx context.Context) {
+	if s.eventCollector == nil {
+		return
+	}
+	s.eventCollector(ctx)
+}
+
+// BootstrapMonitors persists the shared event boundary before producers start.
+func (s *Scheduler) BootstrapMonitors(ctx context.Context) error {
+	if s.notificationMonitor != nil {
+		if err := s.notificationMonitor.Bootstrap(ctx); err != nil {
+			return fmt.Errorf("bootstrap notification monitor: %w", err)
+		}
+	}
+
+	if s.incidentMonitor != nil {
+		if err := s.incidentMonitor.Bootstrap(ctx); err != nil {
+			return fmt.Errorf("bootstrap incident monitor: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Scheduler) startNotificationMonitor(ctx context.Context) {
+	if s.notificationMonitor == nil {
+		return
+	}
+	s.notificationMonitor.Run(ctx)
+}
+
+func (s *Scheduler) startIncidentMonitor(ctx context.Context) {
+	if s.incidentMonitor == nil {
+		return
+	}
+	s.incidentMonitor.Run(ctx)
+}
+
+func (s *Scheduler) startPublicWebhooks(ctx context.Context) {
+	if s.publicWebhooks == nil {
+		return
+	}
+	s.publicWebhooks.Run(ctx)
+}
+
+func (s *Scheduler) startHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(time.Second * 7)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.quit:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.dirLock.Heartbeat(ctx); err != nil {
+				logger.Error(ctx, "Heartbeat failed, scheduler self-fencing", tag.Error(err))
+				// Self-fencing protocol: clear lockHeld BEFORE calling Stop().
+				// This makes releaseDirLock skip Unlock, so a scheduler that just
+				// lost ownership cannot remove a replacement lock acquired by another process.
+				s.lockHeld.Store(false)
+				s.Stop(ctx)
+				return
+			}
+		}
+	}
+}
+
+func (s *Scheduler) startRetryScanner(ctx context.Context) {
+	if s.retryScanner == nil || s.config.Scheduler.RetryFailureWindow <= 0 {
+		logger.Info(ctx, "Retry scanner disabled",
+			tag.Interval(s.config.Scheduler.RetryFailureWindow),
+		)
+		return
+	}
+
+	logger.Info(ctx, "Started retry scanner",
+		tag.Interval(retryScanInterval),
+		slog.Duration("retry_failure_window", s.config.Scheduler.RetryFailureWindow),
+	)
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		select {
+		case <-s.quit:
+			cancel()
+		case <-ctx.Done():
+			cancel()
+		}
+	}()
+
+	s.retryScanner.Start(scanCtx)
+}
+
+// cronLoop runs the main scheduler loop to invoke jobs at scheduled times.
+func (s *Scheduler) cronLoop(ctx context.Context, sig chan os.Signal) {
+	tickTime := s.clock().Truncate(time.Minute)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	s.running.Store(true)
+	defer s.running.Store(false)
+
+	for s.waitForTick(ctx, sig, timer) {
+		now := s.clock()
+		if now.Before(tickTime) {
+			// A clock adjustment must not dispatch a future scheduled slot.
+			timer.Reset(tickTime.Sub(now))
+			continue
+		}
+		switch outcome, wait, since := s.wakeHold.check(ctx, tickTime, now); outcome {
+		case tickLater:
+			timer.Reset(wait)
+			continue
+		case tickHeld:
+			tickTime = s.runHeldTicks(ctx, since)
+		case tickNow:
+			tickTime = s.runTickSafely(ctx, tickTime)
+		}
+		tickTime = s.NextTick(tickTime)
+		timer.Reset(tickTime.Sub(s.clock()))
+	}
+}
+
+func (s *Scheduler) waitForTick(ctx context.Context, sig chan os.Signal, timer *time.Timer) bool {
+	select {
+	case <-ctx.Done():
+		signal.Stop(sig)
+		var received os.Signal
+		_ = errors.As(context.Cause(ctx), &received)
+		<-launcher.PropagateSignal(ctx, received)
+		return false
+	case received := <-sig:
+		signalctx.AbsorbRepeatedTerminate(ctx)
+		signal.Stop(sig)
+		runsDone := launcher.PropagateSignal(ctx, received)
+		s.Stop(ctx)
+		<-runsDone
+		return false
+	case <-s.quit:
+		return false
+	case <-timer.C:
+		_ = timer.Stop()
+		return true
+	}
+}
+
+func (s *Scheduler) runTickSafely(ctx context.Context, tickTime time.Time) (processed time.Time) {
+	processed = tickTime
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(ctx, "Scheduler tick panicked",
+				slog.Time("tick_time", tickTime),
+				tag.Error(panicToError(r)),
+			)
+		}
+	}()
+	if current := s.clock().Truncate(time.Minute); current.After(tickTime) {
+		// Recover missed slots before the next tick advances the checkpoint.
+		s.planner.resume(ctx, current)
+		processed = current
+	}
+	s.runTick(ctx, processed)
+	return processed
+}
+
+func (s *Scheduler) runTick(ctx context.Context, tickTime time.Time) {
+	for _, run := range s.planner.Plan(ctx, tickTime) {
+		s.dispatchRun(ctx, run)
+	}
+	s.planner.Advance(tickTime)
+	s.planner.Flush(ctx)
+}
+
+// runHeldTicks runs the ticks a wake hold kept back, from the minute the
+// host woke in through the minute under way, each run dispatched before the
+// next tick so that tick sees it. What the host slept through is recovered
+// first, as a late tick recovers it. It returns the last tick run.
+func (s *Scheduler) runHeldTicks(ctx context.Context, since time.Time) (processed time.Time) {
+	processed = since.Truncate(time.Minute)
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(ctx, "Scheduler tick panicked",
+				slog.Time("tick_time", processed),
+				tag.Error(panicToError(r)),
+			)
+		}
+	}()
+	s.planner.resume(ctx, processed)
+	last := s.clock().Truncate(time.Minute)
+	for tick := processed; !tick.After(last); tick = tick.Add(time.Minute) {
+		processed = tick
+		for _, run := range s.planner.Plan(ctx, tick) {
+			s.dispatchPlannedRun(ctx, run)
+		}
+		s.planner.Advance(tick)
+		s.planner.Flush(ctx)
+	}
+	return processed
+}
+
+// NextTick returns the next tick time for the scheduler.
+func (*Scheduler) NextTick(now time.Time) time.Time {
+	return now.Truncate(time.Minute).Add(time.Minute)
+}
+
+// IsRunning returns whether the scheduler is currently running.
+func (s *Scheduler) IsRunning() bool {
+	return s.running.Load()
+}
+
+// Stop stops the scheduler.
+func (s *Scheduler) Stop(ctx context.Context) {
+	s.stopOnce.Do(func() {
+		var wg sync.WaitGroup
+		wg.Add(3)
+
+		var startupCancel context.CancelFunc
+		var zd *ZombieDetector
+		s.lifecycleMu.Lock()
+		startupCancel = s.startupCancel
+		s.lock.Lock()
+		close(s.quit)
+		zd = s.zombieDetector
+		s.lock.Unlock()
+		s.lifecycleMu.Unlock()
+
+		if startupCancel != nil {
+			startupCancel()
+		}
+
+		go func() {
+			defer wg.Done()
+			s.stopQueueWatcher(ctx)
+		}()
+
+		go func() {
+			defer wg.Done()
+			s.queueProcessor.Stop()
+		}()
+
+		go func(ctx context.Context) {
+			defer wg.Done()
+			s.stopCron(ctx)
+		}(ctx)
+
+		// Stop the producer (entryReader) synchronously BEFORE the consumer (planner).
+		// This ensures er.quit is closed before drainEvents exits, so any in-flight
+		// sendEvent unblocks via the select on er.quit.
+		s.entryReader.Stop()
+
+		if zd != nil {
+			zd.Stop(ctx)
+		}
+
+		s.planner.Stop(ctx)
+
+		s.releaseDirLock(ctx, "Failed to release scheduler lock in Stop")
+
+		wg.Wait()
+	})
+}
+
+func (s *Scheduler) stopCron(ctx context.Context) {
+	s.updateServiceStatus(ctx, serviceregistry.ServiceStatusInactive, "Failed to update status to inactive", "")
+	s.stopHealthServer(ctx, "Failed to stop health check server")
+	s.closeDAGExecutor(ctx)
+	s.unregisterService(ctx)
+
+	logger.Info(ctx, "Scheduler stopped")
+}
+
+// dispatchRun dispatches a planned run.
+// Catchup runs are dispatched synchronously (enqueue is fast file I/O and
+// we need the result to decide whether to advance the watermark).
+// Non-catchup runs are dispatched in a goroutine (process spawn can be slow).
+// enqueueFileRun queues the run of a file that arrived in a watched folder.
+func (s *Scheduler) enqueueFileRun(ctx context.Context, entry DAGEntry, runID, params string) error {
+	profileName, err := s.dagExecutor.defaultProfileName(ctx, entry.DefinitionID, entry.DAG)
+	if err != nil {
+		return fmt.Errorf("failed to resolve DAG profile: %w", err)
+	}
+	return enqueueTriggeredRun(
+		ctx,
+		s.dagRunRepository,
+		s.queueStore,
+		s.config.Paths.LogDir,
+		s.config.Paths.ArtifactDir,
+		s.config.Paths.BaseConfig,
+		workspace.BaseConfigDir(s.config.Paths.DAGsDir),
+		entry.DefinitionID,
+		entry.DAG,
+		runID,
+		params,
+		profileName,
+		s.clock(),
+		ir.TriggerTypeFile,
+		errInvalidFileRun,
+	)
+}
+
+// errInvalidFileRun says a watched DAG, or the file's params, cannot start a
+// run.
+var errInvalidFileRun = errors.New("the file cannot start a run")
+
+func (s *Scheduler) dispatchRun(ctx context.Context, run PlannedRun) {
+	if run.TriggerType == ir.TriggerTypeCatchUp {
+		s.dispatchPlannedRun(ctx, run)
+		return
+	}
+	go s.dispatchPlannedRun(ctx, run)
+}
+
+func (s *Scheduler) dispatchPlannedRun(ctx context.Context, run PlannedRun) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(ctx, "Run dispatch panicked",
+				tag.DAG(run.DAG.Name),
+				tag.Error(panicToError(r)),
+			)
+		}
+	}()
+	s.planner.DispatchRun(ctx, run)
+}

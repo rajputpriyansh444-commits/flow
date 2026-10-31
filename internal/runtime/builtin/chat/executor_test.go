@@ -1,0 +1,1207 @@
+package chat
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	llmpkg "github.com/rajputpriyansh444-commits/flow/internal/llm"
+	"github.com/rajputpriyansh444-commits/flow/internal/runctx"
+	"github.com/rajputpriyansh444-commits/flow/internal/runtime"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestExecutor_MessageSaving(t *testing.T) {
+	t.Parallel()
+
+	t.Run("SavesAllMessagesWithInherited", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &Executor{
+			step: ir.Step{
+				LLM: &ir.LLMConfig{
+					Provider: "openai",
+					Model:    "gpt-4o",
+				},
+			},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+			},
+			contextMessages: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "You are helpful"},
+				{Role: ir.LLMRoleUser, Content: "Previous question"},
+				{Role: ir.LLMRoleAssistant, Content: "Previous answer"},
+			},
+		}
+
+		// Simulate what happens after Run() completes
+		allMessages := append(executor.contextMessages, executor.messages...)
+		metadata := &ir.LLMMessageMetadata{
+			Provider:         "openai",
+			Model:            "gpt-4o",
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+		}
+		executor.savedMessages = append(allMessages, ir.LLMMessage{
+			Role:     ir.LLMRoleAssistant,
+			Content:  "Hello there!",
+			Metadata: metadata,
+		})
+
+		saved := executor.GetMessages()
+		assert.Len(t, saved, 5) // 3 inherited + 1 user + 1 assistant
+		assert.Equal(t, ir.LLMRoleSystem, saved[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, saved[4].Role)
+		assert.NotNil(t, saved[4].Metadata)
+		assert.Equal(t, 15, saved[4].Metadata.TotalTokens)
+	})
+
+	t.Run("MetadataAlwaysSaved", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &Executor{
+			step: ir.Step{
+				LLM: &ir.LLMConfig{
+					Provider: "gemini",
+					Model:    "gemini-pro",
+				},
+			},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Test"},
+			},
+		}
+
+		metadata := &ir.LLMMessageMetadata{
+			Provider:         "gemini",
+			Model:            "gemini-pro",
+			PromptTokens:     5,
+			CompletionTokens: 3,
+			TotalTokens:      8,
+		}
+		executor.savedMessages = append(executor.messages, ir.LLMMessage{
+			Role:     ir.LLMRoleAssistant,
+			Content:  "Response",
+			Metadata: metadata,
+		})
+
+		saved := executor.GetMessages()
+		assert.Len(t, saved, 2)
+
+		assistantMsg := saved[1]
+		assert.Equal(t, ir.LLMRoleAssistant, assistantMsg.Role)
+		assert.NotNil(t, assistantMsg.Metadata)
+		assert.Equal(t, "gemini", assistantMsg.Metadata.Provider)
+		assert.Equal(t, "gemini-pro", assistantMsg.Metadata.Model)
+		assert.Equal(t, 5, assistantMsg.Metadata.PromptTokens)
+		assert.Equal(t, 3, assistantMsg.Metadata.CompletionTokens)
+		assert.Equal(t, 8, assistantMsg.Metadata.TotalTokens)
+	})
+}
+
+func TestExecutor_SetContext(t *testing.T) {
+	t.Parallel()
+
+	executor := &Executor{}
+
+	messages := []ir.LLMMessage{
+		{Role: ir.LLMRoleSystem, Content: "System prompt"},
+		{Role: ir.LLMRoleUser, Content: "User message"},
+		{Role: ir.LLMRoleAssistant, Content: "Assistant response"},
+	}
+
+	executor.SetContext(messages)
+
+	assert.Equal(t, messages, executor.contextMessages)
+}
+
+func TestExecutor_PushBackExecutionMessagesUsePreviousConversationAndFeedback(t *testing.T) {
+	t.Parallel()
+
+	executor := &Executor{
+		messages: []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "current system"},
+			{Role: ir.LLMRoleUser, Content: "original YAML prompt should not repeat"},
+		},
+		contextMessages: []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "previous system"},
+			{Role: ir.LLMRoleUser, Content: "original prompt"},
+			{Role: ir.LLMRoleAssistant, Content: "previous answer"},
+		},
+	}
+	// The step executor passes only the inputs the step may see.
+	executor.SetPushBackContext(map[string]string{
+		"FEEDBACK": "revise with more detail",
+	}, 2)
+
+	messages, err := executor.executionMessages(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, messages, 4)
+	assert.Equal(t, ir.LLMRoleSystem, messages[0].Role)
+	assert.Equal(t, "current system", messages[0].Content)
+	assert.Equal(t, "original prompt", messages[1].Content)
+	assert.Equal(t, "previous answer", messages[2].Content)
+	assert.Contains(t, messages[3].Content, "iteration 2")
+	assert.Contains(t, messages[3].Content, "FEEDBACK: revise with more detail")
+	assert.NotContains(t, messages[3].Content, "original YAML prompt should not repeat")
+}
+
+func TestExecutor_GetMessages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ReturnsNilWhenEmpty", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &Executor{}
+		assert.Nil(t, executor.GetMessages())
+	})
+
+	t.Run("ReturnsSavedMessages", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &Executor{
+			savedMessages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+				{Role: ir.LLMRoleAssistant, Content: "Hi"},
+			},
+		}
+
+		saved := executor.GetMessages()
+		assert.Len(t, saved, 2)
+		assert.Equal(t, ir.LLMRoleUser, saved[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, saved[1].Role)
+	})
+}
+
+func TestNewChatExecutor(t *testing.T) {
+	t.Parallel()
+
+	t.Run("NilLLMConfig", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{Name: "test"}
+		_, err := newChatExecutor(context.Background(), step)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "llm configuration is required")
+	})
+
+	t.Run("InvalidProvider", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM:  &ir.LLMConfig{Provider: "invalid-provider"},
+		}
+		_, err := newChatExecutor(context.Background(), step)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid provider")
+	})
+
+	t.Run("ValidConfigWithOpenAI", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "openai",
+				Model:    "gpt-4o",
+			},
+		}
+		exec, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+		assert.NotNil(t, exec)
+	})
+
+	t.Run("WithSystemMessage", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "anthropic",
+				Model:    "claude-sonnet-4-6",
+				System:   "You are a helpful assistant",
+			},
+		}
+		exec, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+
+		e := exec.(*Executor)
+		assert.Len(t, e.messages, 1)
+		assert.Equal(t, ir.LLMRoleSystem, e.messages[0].Role)
+		assert.Equal(t, "You are a helpful assistant", e.messages[0].Content)
+	})
+
+	t.Run("WithStepMessages", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "openai",
+				Model:    "gpt-4o",
+			},
+			Messages: []ir.PromptMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+				{Role: ir.LLMRoleAssistant, Content: "Hi there"},
+			},
+		}
+		exec, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+
+		e := exec.(*Executor)
+		assert.Len(t, e.messages, 2)
+		assert.Equal(t, ir.LLMRoleUser, e.messages[0].Role)
+		assert.Equal(t, ir.LLMRoleAssistant, e.messages[1].Role)
+	})
+
+	t.Run("WithSystemAndStepMessages", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "gemini",
+				Model:    "gemini-pro",
+				System:   "Be concise",
+			},
+			Messages: []ir.PromptMessage{
+				{Role: ir.LLMRoleUser, Content: "What is 2+2?"},
+			},
+		}
+		exec, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+
+		e := exec.(*Executor)
+		assert.Len(t, e.messages, 2)
+		assert.Equal(t, ir.LLMRoleSystem, e.messages[0].Role)
+		assert.Equal(t, ir.LLMRoleUser, e.messages[1].Role)
+	})
+
+	t.Run("CustomAPIKeyName", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider:   "openai",
+				Model:      "gpt-4o",
+				APIKeyName: "MY_CUSTOM_KEY",
+			},
+		}
+		exec, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+
+		e := exec.(*Executor)
+		assert.Equal(t, "MY_CUSTOM_KEY", e.apiKeyEnvVar)
+	})
+
+	t.Run("ProviderReferenceIsResolvedAtRunTime", func(t *testing.T) {
+		t.Parallel()
+
+		step := ir.Step{
+			Name: "test",
+			LLM: &ir.LLMConfig{
+				Provider: "${params.PROVIDER}",
+				Model:    "${params.MODEL}",
+			},
+		}
+		_, err := newChatExecutor(context.Background(), step)
+		require.NoError(t, err)
+	})
+}
+
+func TestResolveModels(t *testing.T) {
+	t.Parallel()
+
+	ctx := chatRuntimeContext(t, []string{"PROVIDER=anthropic", "MODEL=claude-sonnet-4-6"})
+
+	t.Run("ResolvesProviderAndModelReferences", func(t *testing.T) {
+		t.Parallel()
+
+		models, err := runtime.ResolveModels(ctx, []ir.ModelEntry{
+			{Provider: "${params.PROVIDER}", Name: "${params.MODEL}", BaseURL: "https://${params.PROVIDER}.example"},
+		})
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		assert.Equal(t, "anthropic", models[0].Provider)
+		assert.Equal(t, "claude-sonnet-4-6", models[0].Name)
+		// base_url is resolved later, once shared config has been merged in.
+		assert.Equal(t, "https://${params.PROVIDER}.example", models[0].BaseURL)
+	})
+
+	t.Run("LeavesLiteralEntriesUnchanged", func(t *testing.T) {
+		t.Parallel()
+
+		models, err := runtime.ResolveModels(ctx, []ir.ModelEntry{
+			{Provider: "openai", Name: "gpt-4o"},
+			{Provider: "${params.PROVIDER}", Name: "${params.MODEL}"},
+		})
+		require.NoError(t, err)
+		require.Len(t, models, 2)
+		assert.Equal(t, ir.ModelEntry{Provider: "openai", Name: "gpt-4o"}, models[0])
+		assert.Equal(t, ir.ModelEntry{Provider: "anthropic", Name: "claude-sonnet-4-6"}, models[1])
+	})
+}
+
+func TestResolveModelsRejectsEmptyValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := chatRuntimeContext(t, []string{"EMPTY=", "PROVIDER=openai", "MODEL=gpt-4o"})
+
+	tests := []struct {
+		name    string
+		llm     ir.LLMConfig
+		wantErr string
+	}{
+		{
+			name:    "string form model resolves to empty",
+			llm:     ir.LLMConfig{Provider: "${params.PROVIDER}", Model: "${params.EMPTY}"},
+			wantErr: `llm model "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name:    "string form provider resolves to empty",
+			llm:     ir.LLMConfig{Provider: "${params.EMPTY}", Model: "${params.MODEL}"},
+			wantErr: `llm provider "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name: "array form model resolves to empty",
+			llm: ir.LLMConfig{Models: []ir.ModelEntry{
+				{Provider: "openai", Name: "gpt-4o"},
+				{Provider: "${params.PROVIDER}", Name: "${params.EMPTY}"},
+			}},
+			wantErr: `llm model "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name: "array form provider resolves to empty",
+			llm: ir.LLMConfig{Models: []ir.ModelEntry{
+				{Provider: "${params.EMPTY}", Name: "${params.MODEL}"},
+			}},
+			wantErr: `llm provider "${params.EMPTY}" resolved to an empty value`,
+		},
+		{
+			name:    "inherited config carries no model",
+			llm:     ir.LLMConfig{Provider: "openai"},
+			wantErr: "llm model is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := runtime.ResolveModels(ctx, tt.llm.GetModels())
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// chatRuntimeContext builds a runtime context whose DAG declares params.
+func chatRuntimeContext(t *testing.T, params []string) context.Context {
+	t.Helper()
+
+	dag := &ir.DAG{Name: "test", Params: params}
+	for _, param := range params {
+		name, _, _ := strings.Cut(param, "=")
+		dag.ParamDefs = append(dag.ParamDefs, ir.ParamDef{Name: name, Type: ir.ParamDefTypeString})
+	}
+	ctx := runctx.NewContext(context.Background(), dag, "run-1", "/tmp/log")
+	return runtime.WithEnv(ctx, runtime.NewEnv(ctx, ir.Step{Name: "test"}))
+}
+
+func TestExecutor_SetStdout(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	e := &Executor{}
+	e.SetStdout(&buf)
+	assert.Equal(t, &buf, e.stdout)
+}
+
+func TestExecutor_SetStderr(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	e := &Executor{}
+	e.SetStderr(&buf)
+	assert.Equal(t, &buf, e.stderr)
+}
+
+func TestExecutor_Kill(t *testing.T) {
+	t.Parallel()
+
+	e := &Executor{}
+	err := e.Kill(os.Interrupt)
+	assert.NoError(t, err)
+}
+
+func TestToLLMMessages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("EmptySlice", func(t *testing.T) {
+		t.Parallel()
+
+		result := toLLMMessages(nil)
+		assert.Empty(t, result)
+	})
+
+	t.Run("ConvertMessages", func(t *testing.T) {
+		t.Parallel()
+
+		msgs := []ir.LLMMessage{
+			{Role: ir.LLMRoleSystem, Content: "System prompt"},
+			{Role: ir.LLMRoleUser, Content: "User message"},
+			{Role: ir.LLMRoleAssistant, Content: "Assistant response"},
+		}
+		result := toLLMMessages(msgs)
+
+		assert.Len(t, result, 3)
+		assert.Equal(t, llmpkg.RoleSystem, result[0].Role)
+		assert.Equal(t, "System prompt", result[0].Content)
+		assert.Equal(t, llmpkg.RoleUser, result[1].Role)
+		assert.Equal(t, "User message", result[1].Content)
+		assert.Equal(t, llmpkg.RoleAssistant, result[2].Role)
+		assert.Equal(t, "Assistant response", result[2].Content)
+	})
+}
+
+func TestBuildMessageList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		stepMsgs        []ir.LLMMessage
+		contextMsgs     []ir.LLMMessage
+		wantFirstSystem string
+		wantLen         int
+	}{
+		{
+			name: "step system takes precedence",
+			stepMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "step system"},
+				{Role: ir.LLMRoleUser, Content: "user"},
+			},
+			contextMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "context system"},
+			},
+			wantFirstSystem: "step system",
+			wantLen:         2,
+		},
+		{
+			name:     "context system used when step has none",
+			stepMsgs: []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "user"}},
+			contextMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "context system"},
+			},
+			wantFirstSystem: "context system",
+			wantLen:         2,
+		},
+		{
+			name: "no context",
+			stepMsgs: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "step system"},
+			},
+			contextMsgs:     nil,
+			wantFirstSystem: "step system",
+			wantLen:         1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := buildMessageList(tt.stepMsgs, tt.contextMsgs)
+
+			require.Len(t, result, tt.wantLen)
+			assert.Equal(t, ir.LLMRoleSystem, result[0].Role)
+			assert.Equal(t, tt.wantFirstSystem, result[0].Content)
+		})
+	}
+}
+
+func TestToThinkingRequest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("NilConfig", func(t *testing.T) {
+		t.Parallel()
+
+		result := toThinkingRequest(nil)
+		assert.Nil(t, result)
+	})
+
+	t.Run("WithConfig", func(t *testing.T) {
+		t.Parallel()
+
+		budget := 1024
+		cfg := &ir.ThinkingConfig{
+			Enabled:         true,
+			Effort:          ir.ThinkingEffortHigh,
+			BudgetTokens:    &budget,
+			IncludeInOutput: true,
+		}
+		result := toThinkingRequest(cfg)
+
+		require.NotNil(t, result)
+		assert.True(t, result.Enabled)
+		assert.Equal(t, llmpkg.ThinkingEffort("high"), result.Effort)
+		assert.Equal(t, &budget, result.BudgetTokens)
+		assert.True(t, result.IncludeInOutput)
+	})
+
+	t.Run("DefaultValues", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := &ir.ThinkingConfig{}
+		result := toThinkingRequest(cfg)
+
+		require.NotNil(t, result)
+		assert.False(t, result.Enabled)
+		assert.Empty(t, result.Effort)
+		assert.Nil(t, result.BudgetTokens)
+		assert.False(t, result.IncludeInOutput)
+	})
+}
+
+type mockProvider struct {
+	chatFunc       func(ctx context.Context, req *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error)
+	chatStreamFunc func(ctx context.Context, req *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error)
+}
+
+func (m *mockProvider) Chat(ctx context.Context, req *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+	return m.chatFunc(ctx, req)
+}
+
+func (m *mockProvider) ChatStream(ctx context.Context, req *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+	return m.chatStreamFunc(ctx, req)
+}
+
+func (m *mockProvider) Name() string {
+	return "mock"
+}
+
+func TestExecutor_RunSimpleForModel_RetriesTransientChatFailure(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			if calls.Add(1) == 1 {
+				return nil, llmpkg.WrapError("openrouter", fmt.Errorf("failed to decode response: %w", io.ErrUnexpectedEOF))
+			}
+			return &llmpkg.ChatResponse{
+				Content:      "done",
+				FinishReason: "stop",
+				Usage:        llmpkg.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Contains(t, stdout.String(), "done")
+	require.Len(t, executor.savedMessages, 2)
+	assert.Equal(t, "done", executor.savedMessages[1].Content)
+}
+
+func TestEmptyAnswerRetry(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			if calls.Add(1) == 1 {
+				return &llmpkg.ChatResponse{
+					FinishReason: "stop",
+					Usage:        llmpkg.Usage{PromptTokens: 4, CompletionTokens: 0, TotalTokens: 4},
+				}, nil
+			}
+			return &llmpkg.ChatResponse{
+				Content:      "done",
+				FinishReason: "stop",
+				Usage:        llmpkg.Usage{PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6},
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, "done\n", stdout.String())
+	require.Len(t, executor.savedMessages, 2)
+	assert.Equal(t, "done", executor.savedMessages[1].Content)
+}
+
+func TestEmptyAnswerFailure(t *testing.T) {
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			calls.Add(1)
+			return &llmpkg.ChatResponse{
+				FinishReason: "length",
+				Usage:        llmpkg.Usage{PromptTokens: 7, CompletionTokens: 0, TotalTokens: 7},
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(3), calls.Load())
+	assert.Contains(t, err.Error(), "finish reason: length")
+	assert.Contains(t, err.Error(), "prompt tokens: 7")
+	assert.Contains(t, err.Error(), "completion tokens: 0")
+	assert.Contains(t, err.Error(), "total tokens: 7")
+	assert.Empty(t, stdout.String())
+	assert.Empty(t, executor.savedMessages)
+}
+
+func TestEmptyAnswerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	executor := &Executor{stdout: new(bytes.Buffer), step: ir.Step{LLM: cfg}}
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			calls.Add(1)
+			return &llmpkg.ChatResponse{FinishReason: "stop", Usage: llmpkg.Usage{PromptTokens: 2, TotalTokens: 2}}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(ctx, provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Contains(t, err.Error(), "finish reason: stop")
+}
+
+func TestNilChatResponseFailure(t *testing.T) {
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	executor := &Executor{stdout: new(bytes.Buffer), step: ir.Step{LLM: cfg}}
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			calls.Add(1)
+			return nil, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Contains(t, err.Error(), "nil response")
+}
+
+func TestUnsolicitedToolCallFails(t *testing.T) {
+	var calls atomic.Int32
+	stream := false
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{stdout: stdoutWriter(&stdout), step: ir.Step{LLM: cfg}}
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			calls.Add(1)
+			return &llmpkg.ChatResponse{
+				ToolCalls: []llmpkg.ToolCall{{
+					ID: "unsolicited", Type: "function",
+					Function: llmpkg.ToolCallFunction{Name: "lookup", Arguments: "{}"},
+				}},
+				FinishReason: "tool_calls",
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(3), calls.Load())
+	assert.Contains(t, err.Error(), "finish reason: tool_calls")
+	assert.Empty(t, stdout.String())
+	assert.Empty(t, executor.savedMessages)
+}
+
+func TestExecutor_RunSimpleForModel_RetriesStreamBeforeFirstDelta(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	stream := true
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			return nil, fmt.Errorf("unexpected Chat call")
+		},
+		chatStreamFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			if calls.Add(1) == 1 {
+				return nil, llmpkg.WrapError("openrouter", fmt.Errorf("failed to decode response: %w", io.ErrUnexpectedEOF))
+			}
+			ch := make(chan llmpkg.StreamEvent, 2)
+			ch <- llmpkg.StreamEvent{Delta: "done"}
+			ch <- llmpkg.StreamEvent{Done: true}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, "done\n", stdout.String())
+}
+
+func TestEmptyStreamRetry(t *testing.T) {
+	var calls atomic.Int32
+	stream := true
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			return nil, fmt.Errorf("unexpected Chat call")
+		},
+		chatStreamFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			if calls.Add(1) == 1 {
+				ch := make(chan llmpkg.StreamEvent, 2)
+				ch <- llmpkg.StreamEvent{
+					Done:         true,
+					FinishReason: "stop",
+					Usage:        &llmpkg.Usage{PromptTokens: 4, CompletionTokens: 0, TotalTokens: 4},
+				}
+				close(ch)
+				return ch, nil
+			}
+			ch := make(chan llmpkg.StreamEvent, 2)
+			ch <- llmpkg.StreamEvent{Delta: "done"}
+			ch <- llmpkg.StreamEvent{Done: true, FinishReason: "stop", Usage: &llmpkg.Usage{PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6}}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, "done\n", stdout.String())
+}
+
+func TestEmptyStreamFailure(t *testing.T) {
+	var calls atomic.Int32
+	stream := true
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			return nil, fmt.Errorf("unexpected Chat call")
+		},
+		chatStreamFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			calls.Add(1)
+			ch := make(chan llmpkg.StreamEvent, 1)
+			ch <- llmpkg.StreamEvent{
+				Done:         true,
+				FinishReason: "length",
+				Usage:        &llmpkg.Usage{PromptTokens: 8, CompletionTokens: 0, TotalTokens: 8},
+			}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(3), calls.Load())
+	assert.Contains(t, err.Error(), "finish reason: length")
+	assert.Contains(t, err.Error(), "prompt tokens: 8")
+	assert.Contains(t, err.Error(), "completion tokens: 0")
+	assert.Contains(t, err.Error(), "total tokens: 8")
+	assert.Empty(t, stdout.String())
+	assert.Empty(t, executor.savedMessages)
+}
+
+func TestExecutor_RunSimpleForModel_DoesNotRetryStreamAfterDelta(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	stream := true
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o", Stream: &stream}
+	var stdout bytes.Buffer
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(context.Context, *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			return nil, fmt.Errorf("unexpected Chat call")
+		},
+		chatStreamFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			calls.Add(1)
+			ch := make(chan llmpkg.StreamEvent, 2)
+			ch <- llmpkg.StreamEvent{Delta: "partial"}
+			ch <- llmpkg.StreamEvent{Error: llmpkg.WrapError("openrouter", fmt.Errorf("failed to decode response: %w", io.ErrUnexpectedEOF)), Done: true}
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	err := executor.runSimpleForModel(context.Background(), provider, []ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.Error(t, err)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Equal(t, "partial", stdout.String())
+}
+
+func TestExecutor_ExecuteToolStep_RetriesTransientChatFailure(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	var stdout bytes.Buffer
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o"}
+	executor := &Executor{
+		stdout: stdoutWriter(&stdout),
+		step:   ir.Step{LLM: cfg},
+	}
+
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			if calls.Add(1) == 1 {
+				return nil, llmpkg.WrapError("openrouter", fmt.Errorf("failed to decode response: %w", io.ErrUnexpectedEOF))
+			}
+			return &llmpkg.ChatResponse{
+				Content:      "tool loop done",
+				FinishReason: "stop",
+				Usage:        llmpkg.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	conv := newConversation([]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}})
+	done, err := executor.executeToolStep(context.Background(), provider, cfg, nil, conv, 0)
+	require.NoError(t, err)
+	assert.True(t, done)
+	assert.Equal(t, int32(2), calls.Load())
+	require.Len(t, conv.messages, 2)
+	assert.Equal(t, "tool loop done", conv.messages[1].Content)
+	assert.Contains(t, stdout.String(), "tool loop done")
+}
+
+func TestEmptyToolAnswer(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	var stdout bytes.Buffer
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o"}
+	executor := &Executor{stdout: stdoutWriter(&stdout), step: ir.Step{LLM: cfg}}
+
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			if calls.Add(1) == 1 {
+				return &llmpkg.ChatResponse{
+					FinishReason: "stop",
+					Usage:        llmpkg.Usage{PromptTokens: 4, CompletionTokens: 0, TotalTokens: 4},
+				}, nil
+			}
+			return &llmpkg.ChatResponse{
+				Content:      "tool loop done",
+				FinishReason: "stop",
+				Usage:        llmpkg.Usage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8},
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	registry := &ToolRegistry{
+		tools:    map[string]*toolInfo{"lookup": {Name: "lookup"}},
+		dagNames: map[string]string{"lookup": "lookup"},
+	}
+	executor.toolExecutor = NewToolExecutor(registry, "")
+	conv := newConversation([]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}})
+	done, err := executor.executeToolStep(context.Background(), provider, cfg, nil, conv, 0)
+	require.NoError(t, err)
+	assert.True(t, done)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, "tool loop done\n", stdout.String())
+	require.Len(t, conv.messages, 2)
+	assert.Equal(t, "tool loop done", conv.messages[1].Content)
+}
+
+func TestEmptyToolCallIsValid(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	var stdout bytes.Buffer
+	cfg := &ir.LLMConfig{Provider: "openai", Model: "gpt-4o"}
+	executor := &Executor{stdout: stdoutWriter(&stdout), step: ir.Step{LLM: cfg}}
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, _ *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			calls.Add(1)
+			return &llmpkg.ChatResponse{
+				ToolCalls: []llmpkg.ToolCall{{
+					ID: "call-1", Type: "function",
+					Function: llmpkg.ToolCallFunction{Name: "lookup", Arguments: "{}"},
+				}},
+				FinishReason: "tool_calls",
+			}, nil
+		},
+		chatStreamFunc: func(context.Context, *llmpkg.ChatRequest) (<-chan llmpkg.StreamEvent, error) {
+			ch := make(chan llmpkg.StreamEvent)
+			close(ch)
+			return ch, nil
+		},
+	}
+
+	registry := &ToolRegistry{
+		tools:    map[string]*toolInfo{"lookup": {Name: "lookup"}},
+		dagNames: map[string]string{"lookup": "lookup"},
+	}
+	executor.toolExecutor = NewToolExecutor(registry, "")
+	tools := registry.ToLLMTools()
+	conv := newConversation([]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}})
+	done, err := executor.executeToolStep(context.Background(), provider, cfg, tools, conv, 0)
+	require.NoError(t, err)
+	assert.False(t, done)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Empty(t, stdout.String())
+}
+
+// A provider's record of a tool-calling turn goes back with that turn on the
+// next request of the loop, and stays out of the saved session.
+func TestExecutor_ToolLoopReplaysProviderState(t *testing.T) {
+	t.Parallel()
+
+	state := &llmpkg.ProviderState{Provider: llmpkg.ProviderAnthropic, Data: []byte(`[{"type":"thinking"}]`)}
+	var requests []*llmpkg.ChatRequest
+	provider := &mockProvider{
+		chatFunc: func(_ context.Context, req *llmpkg.ChatRequest) (*llmpkg.ChatResponse, error) {
+			requests = append(requests, req)
+			if len(requests) == 1 {
+				return &llmpkg.ChatResponse{
+					ToolCalls: []llmpkg.ToolCall{{
+						ID:       "call-1",
+						Type:     "function",
+						Function: llmpkg.ToolCallFunction{Name: "missing", Arguments: "{}"},
+					}},
+					ProviderState: state,
+				}, nil
+			}
+			return &llmpkg.ChatResponse{Content: "done"}, nil
+		},
+	}
+	cfg := &ir.LLMConfig{Provider: "anthropic", Model: "claude-sonnet-4-6"}
+	registry := &ToolRegistry{
+		tools:    map[string]*toolInfo{"lookup": {Name: "lookup"}},
+		dagNames: map[string]string{"lookup": "lookup"},
+	}
+	var stdout bytes.Buffer
+	executor := &Executor{stdout: &stdout, step: ir.Step{LLM: cfg}, toolRegistry: registry}
+
+	err := executor.runWithToolsForModel(chatRuntimeContext(t, nil), provider,
+		[]ir.LLMMessage{{Role: ir.LLMRoleUser, Content: "hello"}}, cfg)
+	require.NoError(t, err)
+
+	require.Len(t, requests, 2)
+	second := requests[1].Messages
+	require.Len(t, second, 3)
+	assert.Equal(t, llmpkg.RoleAssistant, second[1].Role)
+	assert.Same(t, state, second[1].ProviderState)
+	assert.Nil(t, second[0].ProviderState)
+	assert.Nil(t, second[2].ProviderState)
+	assert.Equal(t, "done\n", stdout.String())
+	require.Len(t, executor.GetMessages(), 4)
+}
+
+func stdoutWriter(buf *bytes.Buffer) *bytes.Buffer {
+	return buf
+}
+
+// createContextWithSecrets creates a test context with the given secrets.
+func createContextWithSecrets(secrets map[string]string) context.Context {
+	if secrets == nil {
+		return context.Background()
+	}
+	secretEnvs := make([]string, 0, len(secrets))
+	for k, v := range secrets {
+		secretEnvs = append(secretEnvs, k+"="+v)
+	}
+	return runctx.NewContext(context.Background(), &ir.DAG{Name: "test"}, "run-1", "/tmp/log",
+		runctx.WithSecrets(secretEnvs))
+}
+
+func TestMaskSecretsForProvider(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		secrets    map[string]string
+		messages   []ir.LLMMessage
+		wantMasked []string
+	}{
+		{
+			name:    "no secrets in context",
+			secrets: nil,
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+			},
+			wantMasked: []string{"Hello"},
+		},
+		{
+			name:    "empty secrets",
+			secrets: map[string]string{},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "Hello"},
+			},
+			wantMasked: []string{"Hello"},
+		},
+		{
+			name:    "masks secret in content",
+			secrets: map[string]string{"API_KEY": "secret123"},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleUser, Content: "My key is secret123"},
+			},
+			wantMasked: []string{"My key is *******"},
+		},
+		{
+			name: "masks multiple secrets",
+			secrets: map[string]string{
+				"DB_PASS": "dbpass",
+				"API_KEY": "apikey",
+			},
+			messages: []ir.LLMMessage{
+				{Role: ir.LLMRoleSystem, Content: "Use dbpass for DB"},
+				{Role: ir.LLMRoleUser, Content: "Key is apikey"},
+			},
+			wantMasked: []string{
+				"Use ******* for DB",
+				"Key is *******",
+			},
+		},
+		{
+			name:    "preserves role and metadata for multiple messages",
+			secrets: map[string]string{"SECRET": "xyz"},
+			messages: []ir.LLMMessage{
+				{
+					Role:     ir.LLMRoleUser,
+					Content:  "Value: xyz",
+					Metadata: nil,
+				},
+				{
+					Role:     ir.LLMRoleAssistant,
+					Content:  "Response with xyz",
+					Metadata: &ir.LLMMessageMetadata{Model: "gpt-4", PromptTokens: 10, CompletionTokens: 5},
+				},
+				{
+					Role:     ir.LLMRoleUser,
+					Content:  "Another xyz message",
+					Metadata: &ir.LLMMessageMetadata{Provider: "openai"},
+				},
+			},
+			wantMasked: []string{"Value: *******", "Response with *******", "Another ******* message"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := createContextWithSecrets(tt.secrets)
+			result := maskSecretsForProvider(ctx, tt.messages)
+
+			require.Len(t, result, len(tt.wantMasked))
+			for i, want := range tt.wantMasked {
+				assert.Equal(t, want, result[i].Content)
+				assert.Equal(t, tt.messages[i].Role, result[i].Role)
+				// Verify metadata is preserved for each message
+				assert.Equal(t, tt.messages[i].Metadata, result[i].Metadata)
+			}
+		})
+	}
+}

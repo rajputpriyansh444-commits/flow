@@ -1,0 +1,571 @@
+package ir
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/stringutil"
+)
+
+const (
+	canonicalAbortHandlerName = "onAbort"
+	legacyAbortHandlerName    = "onCancel"
+)
+
+// InitialStatus creates an initial Status object for the given DAG
+func InitialStatus(dag *DAG) DAGRunStatus {
+	var (
+		autoRetryLimit       int
+		autoRetryInterval    time.Duration
+		autoRetryBackoff     float64
+		autoRetryMaxInterval time.Duration
+		procGroup            string
+		definitionID         string
+	)
+	if dag != nil {
+		procGroup = dag.ProcGroup()
+		definitionID = dag.SuspendFlagName()
+		if dag.RetryPolicy != nil {
+			autoRetryLimit = dag.RetryPolicy.Limit
+			autoRetryInterval = dag.RetryPolicy.Interval
+			autoRetryBackoff = dag.RetryPolicy.Backoff
+			autoRetryMaxInterval = dag.RetryPolicy.MaxInterval
+		}
+	}
+
+	return DAGRunStatus{
+		Name:                 dag.Name,
+		Status:               NotStarted,
+		ModelUsageRecorded:   true,
+		PID:                  PID(0),
+		Nodes:                NewNodesFromSteps(dag.Steps),
+		OnInit:               newNodeOrNil(dag.HandlerOn.Init),
+		OnExit:               newNodeOrNil(dag.HandlerOn.Exit),
+		OnSuccess:            newNodeOrNil(dag.HandlerOn.Success),
+		OnFailure:            newNodeOrNil(dag.HandlerOn.Failure),
+		OnAbort:              newNodeOrNil(dag.HandlerOn.Abort),
+		OnWait:               newNodeOrNil(dag.HandlerOn.Wait),
+		Params:               strings.Join(dag.Params, " "),
+		ParamsList:           dag.Params,
+		AutoRetryCount:       0,
+		AutoRetryLimit:       autoRetryLimit,
+		AutoRetryInterval:    autoRetryInterval,
+		AutoRetryBackoff:     autoRetryBackoff,
+		AutoRetryMaxInterval: autoRetryMaxInterval,
+		ProcGroup:            procGroup,
+		DefinitionID:         definitionID,
+		CreatedAt:            time.Now().UnixMilli(),
+		StartedAt:            stringutil.FormatTime(time.Time{}),
+		FinishedAt:           stringutil.FormatTime(time.Time{}),
+		Preconditions:        conditionResults(dag.Preconditions),
+		Labels:               dag.Labels.Strings(),
+	}
+}
+
+// The condition types that tell whether a queued DAG-run can start, their
+// statuses, and the reasons recorded when no worker can take the run.
+const (
+	DAGRunConditionRunnable    = "Runnable"
+	DAGRunConditionWorkerReady = "WorkerReady"
+
+	DAGRunConditionStatusTrue    = "True"
+	DAGRunConditionStatusFalse   = "False"
+	DAGRunConditionStatusUnknown = "Unknown"
+
+	DAGRunReasonNoMatchingWorker          = "NoMatchingWorker"
+	DAGRunReasonNoAvailableWorker         = "NoAvailableWorker"
+	DAGRunReasonWorkerDispatchUnavailable = "WorkerDispatchUnavailable"
+)
+
+// NoMatchingWorkerConditions are the conditions a run waits under when no
+// healthy worker carries the labels its selector requires. The scheduler's
+// queue and the coordinator write the same pair, so a waiting run reads the
+// same however it was dispatched.
+func NoMatchingWorkerConditions(checkedAt time.Time) []DAGRunCondition {
+	return []DAGRunCondition{
+		NewDAGRunCondition(DAGRunConditionRunnable, DAGRunConditionStatusFalse, DAGRunReasonNoMatchingWorker,
+			"The DAG-run cannot start because no healthy worker matches the required selector.", checkedAt),
+		NewDAGRunCondition(DAGRunConditionWorkerReady, DAGRunConditionStatusFalse, DAGRunReasonNoMatchingWorker,
+			"No healthy worker matches the required worker selector.", checkedAt),
+	}
+}
+
+// NoAvailableWorkerConditions are the conditions a run waits under when no
+// healthy distributed worker exists at all.
+func NoAvailableWorkerConditions(checkedAt time.Time) []DAGRunCondition {
+	return []DAGRunCondition{
+		NewDAGRunCondition(DAGRunConditionRunnable, DAGRunConditionStatusFalse, DAGRunReasonNoAvailableWorker,
+			"The DAG-run cannot start because no healthy distributed worker is available.", checkedAt),
+		NewDAGRunCondition(DAGRunConditionWorkerReady, DAGRunConditionStatusFalse, DAGRunReasonNoAvailableWorker,
+			"No healthy distributed worker is available.", checkedAt),
+	}
+}
+
+// DAGRunCondition describes an observed runtime condition for a DAG-run.
+type DAGRunCondition struct {
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason"`
+	Message   string `json:"message"`
+	CheckedAt string `json:"checkedAt"`
+}
+
+// NewDAGRunCondition creates a runtime condition for a DAG-run.
+func NewDAGRunCondition(conditionType, status, reason, message string, checkedAt time.Time) DAGRunCondition {
+	return DAGRunCondition{
+		Type:      conditionType,
+		Status:    status,
+		Reason:    reason,
+		Message:   message,
+		CheckedAt: stringutil.FormatTime(checkedAt),
+	}
+}
+
+// MergeDAGRunConditions merges observations into a type-keyed current-state list.
+func MergeDAGRunConditions(conditions []DAGRunCondition, observations ...DAGRunCondition) []DAGRunCondition {
+	merged := make([]DAGRunCondition, 0, len(conditions)+len(observations))
+	for _, condition := range conditions {
+		merged = upsertDAGRunCondition(merged, condition)
+	}
+	for _, observation := range observations {
+		merged = upsertDAGRunCondition(merged, observation)
+	}
+	sortDAGRunConditions(merged)
+	return merged
+}
+
+func upsertDAGRunCondition(conditions []DAGRunCondition, incoming DAGRunCondition) []DAGRunCondition {
+	for i := range conditions {
+		if conditions[i].Type != incoming.Type {
+			continue
+		}
+		if existingDAGRunConditionIsNewer(conditions[i], incoming) {
+			return conditions
+		}
+		conditions[i] = incoming
+		return conditions
+	}
+	return append(conditions, incoming)
+}
+
+func existingDAGRunConditionIsNewer(existing, incoming DAGRunCondition) bool {
+	existingCheckedAt, existingOK := parseDAGRunConditionCheckedAt(existing)
+	incomingCheckedAt, incomingOK := parseDAGRunConditionCheckedAt(incoming)
+	if existingOK && !incomingOK {
+		return true
+	}
+	if !existingOK || !incomingOK {
+		return false
+	}
+	return existingCheckedAt.After(incomingCheckedAt)
+}
+
+func parseDAGRunConditionCheckedAt(condition DAGRunCondition) (time.Time, bool) {
+	checkedAt, err := stringutil.ParseTime(condition.CheckedAt)
+	return checkedAt, err == nil && !checkedAt.IsZero()
+}
+
+func sortDAGRunConditions(conditions []DAGRunCondition) {
+	sort.SliceStable(conditions, func(i, j int) bool {
+		leftType := conditions[i].Type
+		rightType := conditions[j].Type
+		switch {
+		case leftType == rightType:
+			return false
+		case leftType == "Runnable":
+			return true
+		case rightType == "Runnable":
+			return false
+		default:
+			return leftType < rightType
+		}
+	})
+}
+
+// DAGRunStatus represents the complete execution state of a dag-run.
+type DAGRunStatus struct {
+	Root         DAGRunRef         `json:"root,omitzero"`
+	Parent       DAGRunRef         `json:"parent,omitzero"`
+	Name         string            `json:"name"`
+	DAGRunID     string            `json:"dagRunId"`
+	AttemptID    string            `json:"attemptId"`
+	AttemptKey   string            `json:"attemptKey,omitempty"` // Globally unique attempt identifier
+	ClaimKey     string            `json:"claimKey,omitempty"`   // Worker claim that executes this attempt
+	Status       Status            `json:"status"`
+	Conditions   []DAGRunCondition `json:"conditions,omitempty"`
+	TriggerType  TriggerType       `json:"triggerType,omitempty"`
+	TriggerActor string            `json:"triggerActor,omitempty"`
+	// Resume marks a queued checkpoint resume. Retry planning honors it only
+	// while the attempt is queued, so retries of finished runs reset as usual.
+	Resume        bool                   `json:"resume,omitempty"`
+	WorkerID      string                 `json:"workerId,omitempty"`
+	PID           PID                    `json:"pid,omitempty"`
+	PIDStartedAt  int64                  `json:"pidStartedAt,omitempty"`
+	Nodes         []*Node                `json:"nodes,omitempty"`
+	AgentSessions []AgentSessionResource `json:"agentSessions,omitempty"`
+	// ModelUsageRecorded marks a status written by an engine that records
+	// each step's model usage, so a run that shows none used no model
+	// rather than ran before the engine recorded it.
+	ModelUsageRecorded bool   `json:"modelUsageRecorded,omitempty"`
+	OnInit             *Node  `json:"onInit,omitempty"`
+	OnExit             *Node  `json:"onExit,omitempty"`
+	OnSuccess          *Node  `json:"onSuccess,omitempty"`
+	OnFailure          *Node  `json:"onFailure,omitempty"`
+	OnAbort            *Node  `json:"onAbort,omitempty"`
+	OnWait             *Node  `json:"onWait,omitempty"`
+	CreatedAt          int64  `json:"createdAt,omitempty"`
+	QueuedAt           string `json:"queuedAt,omitempty"`
+	ScheduleTime       string `json:"scheduleTime,omitempty"`
+	StartedAt          string `json:"startedAt,omitempty"`
+	FinishedAt         string `json:"finishedAt,omitempty"`
+	AutoRetryCount     int    `json:"autoRetryCount,omitempty"`
+	AutoRetryLimit     int    `json:"autoRetryLimit,omitempty"`
+	// AutoRetryInterval is stored as a duration snapshot for retry scanner decisions.
+	AutoRetryInterval time.Duration `json:"autoRetryInterval,omitempty"`
+	AutoRetryBackoff  float64       `json:"autoRetryBackoff,omitempty"`
+	// AutoRetryMaxInterval is stored as a duration snapshot for retry scanner decisions.
+	AutoRetryMaxInterval time.Duration `json:"autoRetryMaxInterval,omitempty"`
+	ProcGroup            string        `json:"procGroup,omitempty"`
+	DefinitionID         string        `json:"definitionId,omitempty"`
+	// SuspendFlagName is retained for histories written before DefinitionID was introduced.
+	SuspendFlagName    string                `json:"suspendFlagName,omitempty"`
+	Log                string                `json:"log,omitempty"`
+	WorkingDir         string                `json:"workingDir,omitempty"`
+	ArchiveDir         string                `json:"archiveDir,omitempty"`
+	Error              string                `json:"error,omitempty"`
+	Params             string                `json:"params,omitempty"`
+	ParamsList         []string              `json:"paramsList,omitempty"`
+	ParallelItem       string                `json:"parallelItem,omitempty"`
+	ProfileName        string                `json:"profileName,omitempty"`
+	ProfileResolvedAt  string                `json:"profileResolvedAt,omitempty"`
+	ProfileEntries     []RuntimeProfileEntry `json:"profileEntries,omitempty"`
+	NoReuse            bool                  `json:"noReuse,omitempty"`
+	PendingStepRetries []PendingStepRetry    `json:"pendingStepRetries"`
+	Preconditions      []ConditionResult     `json:"preconditions,omitempty"`
+	Labels             []string              `json:"labels,omitempty"`
+	LeaseAt            int64                 `json:"leaseAt,omitempty"` // Unix millis; stamped by coordinator on observed run liveness
+
+	// Ephemeral marks a run that leaves no trace: it is stored apart from the
+	// history, is not listed, emits no events, and is removed after it ends.
+	Ephemeral bool `json:"ephemeral,omitempty"`
+
+	// SkipHandlers marks a selected-steps run whose selection has no graph end
+	// step. The run, and every retry of it, does not call the end-of-run
+	// handlers of the DAG.
+	SkipHandlers bool `json:"skipHandlers,omitempty"`
+
+	// ReusedInputs records, for each skipped step of a selected-steps run,
+	// where its carried outputs come from. The order is the DAG step order.
+	ReusedInputs []ReusedInput `json:"reusedInputs,omitempty"`
+}
+
+// ReusedInputVia tells how the outputs of a skipped step reached a run.
+type ReusedInputVia string
+
+const (
+	// ReusedInputViaRun marks outputs carried from a finished run named by the
+	// request (outputsFromRunId, or outputsFromRuns for one step).
+	ReusedInputViaRun ReusedInputVia = "run"
+	// ReusedInputViaCache marks outputs that the request supplied, with the run they were captured from.
+	ReusedInputViaCache ReusedInputVia = "cache"
+)
+
+// ReusedInput is the provenance of the outputs of one skipped step.
+type ReusedInput struct {
+	// Step is the name of the skipped step.
+	Step string `json:"step"`
+	// RunID is the run the outputs come from. That run may no longer exist.
+	RunID string `json:"runId"`
+	// CapturedAt is when the outputs were captured, in the format of the run
+	// timestamps. It is empty when unknown.
+	CapturedAt string `json:"capturedAt,omitempty"`
+	// StartedAt and FinishedAt are the times that the step had in the run the
+	// outputs come from, in the format of the run timestamps. They are empty
+	// when unknown, and for outputs that a request supplied.
+	StartedAt  string         `json:"startedAt,omitempty"`
+	FinishedAt string         `json:"finishedAt,omitempty"`
+	Via        ReusedInputVia `json:"via"`
+}
+
+// EffectiveClaimKey returns ClaimKey, falling back to AttemptKey when no claim
+// is recorded.
+func (s DAGRunStatus) EffectiveClaimKey() string {
+	if s.ClaimKey != "" {
+		return s.ClaimKey
+	}
+	// TODO: Remove the AttemptKey fallback in the next major version.
+	return s.AttemptKey
+}
+
+// NormalizeDAGRunConditions clears runtime conditions from non-queued statuses.
+func NormalizeDAGRunConditions(status *DAGRunStatus) {
+	if status == nil {
+		return
+	}
+	if status.Status == Queued {
+		if len(status.Conditions) > 0 {
+			status.Conditions = MergeDAGRunConditions(nil, status.Conditions...)
+		}
+		return
+	}
+	status.Conditions = nil
+}
+
+// DAGRun returns a reference to the dag-run associated with this status
+func (st *DAGRunStatus) DAGRun() DAGRunRef {
+	return NewDAGRunRef(st.Name, st.DAGRunID)
+}
+
+// DAGDefinitionID returns the persisted definition identity for this run.
+func (st *DAGRunStatus) DAGDefinitionID() string {
+	if st == nil {
+		return ""
+	}
+	if st.DefinitionID != "" {
+		return st.DefinitionID
+	}
+	return st.SuspendFlagName
+}
+
+// NodesInRunOrder returns the run's step nodes together with the lifecycle
+// handler nodes that were configured, ordered by when they run. Handlers that
+// the DAG does not declare are omitted.
+func (st *DAGRunStatus) NodesInRunOrder() []*Node {
+	afterSteps := []*Node{st.OnWait, st.OnSuccess, st.OnFailure, st.OnAbort, st.OnExit}
+
+	nodes := make([]*Node, 0, len(st.Nodes)+1+len(afterSteps))
+	if st.OnInit != nil {
+		nodes = append(nodes, st.OnInit)
+	}
+	nodes = append(nodes, st.Nodes...)
+	for _, node := range afterSteps {
+		if node != nil {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
+
+// Errors returns a slice of errors for the current status
+func (st *DAGRunStatus) Errors() []error {
+	var errs []error
+	if st.Error != "" {
+		errs = append(errs, errors.New(st.Error))
+	}
+	for _, node := range st.Nodes {
+		if node.Error != "" {
+			errs = append(errs, fmt.Errorf("node %s: %s", node.Step.Name, node.Error))
+		}
+	}
+	for _, handler := range st.handlerNodes() {
+		if handler.node != nil && handler.node.Error != "" {
+			errs = append(errs, fmt.Errorf("%s: %s", handler.name, handler.node.Error))
+		}
+	}
+	return errs
+}
+
+// ErrorText returns the error message for the run: the run-level error when
+// present, otherwise the errors of failed steps and lifecycle handlers as
+// "step: message" lines in run order. ANSI escape sequences are removed.
+func (st *DAGRunStatus) ErrorText() string {
+	if st == nil {
+		return ""
+	}
+	text := st.Error
+	if strings.TrimSpace(text) == "" {
+		var stepErrors []string
+		for _, node := range st.NodesInRunOrder() {
+			if node == nil || node.Status != NodeFailed {
+				continue
+			}
+			if message := strings.TrimSpace(node.Error); message != "" {
+				stepErrors = append(stepErrors, node.Step.Name+": "+message)
+			}
+		}
+		text = strings.Join(stepErrors, "\n")
+	}
+	return stringutil.StripANSI(text)
+}
+
+// pendingStepRetriesFromNodes extracts pending parent-managed step retries from
+// a DAG status snapshot.
+func pendingStepRetriesFromNodes(nodes []*Node) []PendingStepRetry {
+	var retries []PendingStepRetry
+	for _, node := range nodes {
+		if retry, ok := pendingStepRetryForNode(node.Step.Name, node); ok {
+			retries = append(retries, retry)
+		}
+	}
+	return retries
+}
+
+// PendingStepRetriesFromStatus returns the persisted pending step retries when
+// present and falls back to deriving them from node state for older statuses
+// that predate the field.
+func PendingStepRetriesFromStatus(status *DAGRunStatus) []PendingStepRetry {
+	if status == nil {
+		return nil
+	}
+	if status.PendingStepRetries != nil {
+		return status.PendingStepRetries
+	}
+
+	retries := pendingStepRetriesFromNodes(status.Nodes)
+	for _, handler := range status.handlerNodes() {
+		stepName := handler.name
+		if handler.node != nil && handler.node.Step.Name != "" {
+			stepName = handler.node.Step.Name
+		}
+		if retry, ok := pendingStepRetryForNode(stepName, handler.node); ok {
+			retries = append(retries, retry)
+		}
+	}
+	return retries
+}
+
+// NodeByName returns the node with the specified name.
+// For handlers, it matches on both the handler label (e.g., "onSuccess")
+// and the step name within the handler.
+func (st *DAGRunStatus) NodeByName(name string) (*Node, error) {
+	name = normalizeAbortHandlerLookup(name)
+	for _, node := range st.Nodes {
+		if node.Step.Name == name {
+			return node, nil
+		}
+	}
+	for _, handler := range st.handlerNodes() {
+		if handler.node != nil {
+			// Match on handler label (e.g., "onSuccess") or step name
+			if handler.name == name || handler.node.Step.Name == name {
+				return handler.node, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("node %s not found", name)
+}
+
+// StoredStatus returns the status as a status file stores it: each node keeps
+// an output repeated under its other output fields once. Reading it back with
+// StatusFromJSON restores every field. The status passed in is not changed.
+func StoredStatus(st DAGRunStatus) DAGRunStatus {
+	stored := st
+	if st.Nodes != nil {
+		stored.Nodes = make([]*Node, len(st.Nodes))
+		for i, node := range st.Nodes {
+			stored.Nodes[i] = storedNode(node)
+		}
+	}
+	stored.OnInit = storedNode(st.OnInit)
+	stored.OnExit = storedNode(st.OnExit)
+	stored.OnSuccess = storedNode(st.OnSuccess)
+	stored.OnFailure = storedNode(st.OnFailure)
+	stored.OnAbort = storedNode(st.OnAbort)
+	stored.OnWait = storedNode(st.OnWait)
+	return stored
+}
+
+// StatusFromJSON deserializes a JSON string into a Status object
+func StatusFromJSON(s string) (*DAGRunStatus, error) {
+	var status DAGRunStatus
+	if err := json.Unmarshal([]byte(s), &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// UnmarshalJSON keeps legacy onCancel and tags status files readable while
+// normalizing canonical handler/metadata names in memory.
+func (st *DAGRunStatus) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	_, hasLabels := raw["labels"]
+
+	type alias DAGRunStatus
+	aux := struct {
+		alias
+		OnCancel       *Node    `json:"onCancel,omitempty"`
+		DeprecatedTags []string `json:"tags,omitempty"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	*st = DAGRunStatus(aux.alias)
+	if !hasLabels && len(aux.DeprecatedTags) > 0 {
+		st.Labels = aux.DeprecatedTags
+	}
+	if st.OnAbort == nil {
+		st.OnAbort = aux.OnCancel
+	}
+	normalizeAbortHandlerNode(st.OnAbort)
+	return nil
+}
+
+// PID represents a process ID for a running dag-run
+type PID int
+
+// String returns the string representation of the PID, or an empty string if 0
+func (p PID) String() string {
+	if p <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d", p)
+}
+
+// handlerNode pairs a handler node with its name for iteration
+type handlerNode struct {
+	name string
+	node *Node
+}
+
+// handlerNodes returns all handler nodes for iteration
+func (st *DAGRunStatus) handlerNodes() []handlerNode {
+	return []handlerNode{
+		{"onInit", st.OnInit},
+		{"onExit", st.OnExit},
+		{"onSuccess", st.OnSuccess},
+		{"onFailure", st.OnFailure},
+		{canonicalAbortHandlerName, st.OnAbort},
+		{"onWait", st.OnWait},
+	}
+}
+
+func normalizeAbortHandlerLookup(name string) string {
+	if name == legacyAbortHandlerName {
+		return canonicalAbortHandlerName
+	}
+	return name
+}
+
+func normalizeAbortHandlerNode(node *Node) {
+	if node == nil {
+		return
+	}
+	if node.Step.Name == "" || node.Step.Name == legacyAbortHandlerName {
+		node.Step.Name = canonicalAbortHandlerName
+	}
+}
+
+func pendingStepRetryForNode(stepName string, node *Node) (PendingStepRetry, bool) {
+	if node == nil || node.Status != NodeRetrying || stepName == "" {
+		return PendingStepRetry{}, false
+	}
+
+	interval := CalculateBackoffInterval(
+		node.Step.RetryPolicy.Interval,
+		node.Step.RetryPolicy.Backoff,
+		node.Step.RetryPolicy.MaxInterval,
+		node.RetryCount-1,
+	)
+	return PendingStepRetry{
+		StepName: stepName,
+		Interval: interval,
+	}, true
+}

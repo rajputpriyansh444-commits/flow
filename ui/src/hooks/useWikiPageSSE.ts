@@ -1,0 +1,23 @@
+import { components } from '../api/v1/schema';
+import { SSEState, useSSE } from './useSSE';
+
+type WikiPageResponse = components['schemas']['WikiPageResponse'];
+
+export function useWikiPageSSE(
+  wikiPagePath: string,
+  enabled: boolean = true,
+  workspaceQuery: {
+    workspace?: components['parameters']['Workspace'];
+  } = {},
+  remoteNode: components['parameters']['RemoteNode'] = 'local'
+): SSEState<WikiPageResponse> {
+  const encodedPath = wikiPagePath.split('/').map(encodeURIComponent).join('/');
+  const params = new URLSearchParams();
+  params.set('remoteNode', remoteNode);
+  if (workspaceQuery.workspace) {
+    params.set('workspace', workspaceQuery.workspace);
+  }
+  const query = params.toString();
+  const endpoint = `/events/wiki/${encodedPath}${query ? `?${query}` : ''}`;
+  return useSSE<WikiPageResponse>(endpoint, enabled && !!wikiPagePath, remoteNode);
+}

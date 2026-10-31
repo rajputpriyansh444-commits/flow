@@ -1,0 +1,23 @@
+package api_test
+
+import (
+	"testing"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSpecification(t *testing.T) {
+	t.Parallel()
+
+	spec, err := openapi3.NewLoader().LoadFromFile("api.yaml")
+	require.NoError(t, err)
+	require.NoError(t, spec.Validate(t.Context()))
+
+	channelTest := spec.Paths.Find("/notification-channels/{channelId}/test").Post
+	require.NotNil(t, channelTest.Security)
+	require.ElementsMatch(t, openapi3.SecurityRequirements{
+		{"apiToken": []string{}},
+		{"basicAuth": []string{}},
+	}, *channelTest.Security)
+}

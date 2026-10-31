@@ -1,0 +1,161 @@
+package registry
+
+import (
+	"context"
+	"sync"
+
+	cmnvalue "github.com/rajputpriyansh444-commits/flow/internal/cmn/value"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+)
+
+// ExecutorCapabilities defines what an executor can do.
+type ExecutorCapabilities struct {
+	// Command indicates whether the executor supports the command field.
+	Command bool
+	// MultipleCommands indicates whether the executor supports multiple commands.
+	MultipleCommands bool
+	// Script indicates whether the executor supports the script field.
+	Script bool
+	// Shell indicates whether the executor uses shell/shellArgs/shellPackages.
+	Shell bool
+	// Stdin indicates whether the executor supports the stdin field for piping
+	// a file's contents to the command's standard input.
+	Stdin bool
+	// Container indicates whether the executor supports step-level container config.
+	Container bool
+	// SubDAG indicates whether the executor can execute sub-DAGs.
+	SubDAG bool
+	// WorkerSelector indicates whether the executor supports worker selection.
+	WorkerSelector bool
+	// LLM indicates whether the executor supports the llm field.
+	LLM bool
+	// Messages indicates whether the executor takes the messages field and
+	// requires at least one message when an llm config is present.
+	Messages bool
+	// CommandContext returns command execution facts for command field resolution.
+	CommandContext func(ctx context.Context, step ir.Step) cmnvalue.CommandContext
+	// ScriptContext returns command execution facts for script field resolution.
+	ScriptContext func(ctx context.Context, step ir.Step) cmnvalue.CommandContext
+	// DryRunCheck reports what a dry run can tell will fail on this host, such
+	// as a file the step reads that does not exist, without running the step.
+	// It receives the declared step with its with fields resolved as far as a
+	// dry run can; a value that still holds a reference, such as a step
+	// output, is left as written and the check must skip it. The error's text
+	// is shown as a warning and never fails the dry run; several problems can
+	// be joined into one error.
+	DryRunCheck func(ctx context.Context, step ir.Step) error
+	// ConfigWarnings reports settings in the step's configuration that are
+	// valid but likely give results the author does not expect. Loading the
+	// DAG shows each message as a warning. It also receives steps that fail
+	// validation and need not report what validation already does.
+	ConfigWarnings func(step ir.Step) []string
+	// PathInputs lists the with keys whose values name filesystem paths. A
+	// backslash in those values is path text, never a Flow escape marker.
+	PathInputs []string
+}
+
+// executorCapabilitiesRegistry is a typed registry of executor capabilities.
+type executorCapabilitiesRegistry struct {
+	mu   sync.RWMutex
+	caps map[string]ExecutorCapabilities
+}
+
+var executorCapabilities = executorCapabilitiesRegistry{
+	caps: make(map[string]ExecutorCapabilities),
+}
+
+// Register registers capabilities for an executor type.
+func (r *executorCapabilitiesRegistry) Register(executorType string, caps ExecutorCapabilities) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.caps[executorType] = caps
+}
+
+// Unregister removes capabilities for an executor type.
+func (r *executorCapabilitiesRegistry) Unregister(executorType string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.caps, executorType)
+}
+
+// Get returns capabilities for an executor type.
+// Returns an empty ExecutorCapabilities if not registered.
+func (r *executorCapabilitiesRegistry) Get(executorType string) ExecutorCapabilities {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if caps, ok := r.caps[executorType]; ok {
+		return caps
+	}
+	// Default: return all false (strict mode)
+	return ExecutorCapabilities{}
+}
+
+// Contains reports whether capabilities were registered for an executor type.
+func (r *executorCapabilitiesRegistry) Contains(executorType string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.caps[executorType]
+	return ok
+}
+
+// RegisterExecutorCapabilities registers capabilities for an executor type.
+func RegisterExecutorCapabilities(executorType string, caps ExecutorCapabilities) {
+	executorCapabilities.Register(executorType, caps)
+}
+
+// UnregisterExecutorCapabilities removes capabilities for an executor type.
+func UnregisterExecutorCapabilities(executorType string) {
+	executorCapabilities.Unregister(executorType)
+}
+
+// ExecutorCapabilitiesFor returns the registered capabilities for an executor type.
+func ExecutorCapabilitiesFor(executorType string) ExecutorCapabilities {
+	return executorCapabilities.Get(executorType)
+}
+
+// IsExecutorRegistered reports whether an executor type has registered metadata.
+func IsExecutorRegistered(executorType string) bool {
+	return executorCapabilities.Contains(executorType)
+}
+
+// CommandResolution returns command execution facts for command field resolution.
+func CommandResolution(ctx context.Context, s ir.Step) cmnvalue.CommandContext {
+	caps := executorCapabilities.Get(s.ExecutorConfig.Type)
+	if caps.CommandContext != nil {
+		return caps.CommandContext(ctx, s)
+	}
+	return cmnvalue.CommandContext{}
+}
+
+// ScriptResolution returns command execution facts for script field resolution.
+func ScriptResolution(ctx context.Context, s ir.Step) cmnvalue.CommandContext {
+	caps := executorCapabilities.Get(s.ExecutorConfig.Type)
+	if caps.ScriptContext != nil {
+		return caps.ScriptContext(ctx, s)
+	}
+	if caps.CommandContext != nil {
+		return caps.CommandContext(ctx, s)
+	}
+	return cmnvalue.CommandContext{}
+}
+
+// ConfigField returns the field that resolves the step's with object at path.
+func ConfigField(s ir.Step, path string) cmnvalue.Field {
+	return cmnvalue.ExecutorConfigField(path).WithPathKeys(PathInputs(s)...)
+}
+
+// PathInputs returns the with keys of the step's executor whose values name
+// filesystem paths.
+func PathInputs(s ir.Step) []string {
+	return executorCapabilities.Get(s.ExecutorConfig.Type).PathInputs
+}
+
+// StepConfigWarnings returns the configuration warnings the step's executor
+// reports.
+func StepConfigWarnings(s ir.Step) []string {
+	caps := executorCapabilities.Get(s.ExecutorConfig.Type)
+	if caps.ConfigWarnings == nil {
+		return nil
+	}
+	return caps.ConfigWarnings(s)
+}

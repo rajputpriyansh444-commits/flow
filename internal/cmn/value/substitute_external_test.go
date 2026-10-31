@@ -1,0 +1,78 @@
+package value_test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/cmdutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/value"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const psEchoHello = cmdutil.PowerShellImportCoreModules + "; echo hello"
+
+func TestBuildShellCommandForPowerShellUsesStableInvocation(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("pwsh", "echo hello")
+
+	assert.Equal(t, "pwsh", shellBaseNameForTest(cmd.Path))
+	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-Command", psEchoHello}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandForPowerShellKeepsUsingFirst(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("pwsh", "using namespace System.Text; [StringBuilder]::new().Length")
+
+	assert.Equal(t, "using namespace System.Text; [StringBuilder]::new().Length", cmd.Args[len(cmd.Args)-1])
+}
+
+func TestBuildShellCommandParsesConfiguredShellArgs(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("powershell -ExecutionPolicy Bypass", "echo hello")
+
+	assert.Equal(t, "powershell", shellBaseNameForTest(cmd.Path))
+	assert.Equal(t, []string{
+		"-ExecutionPolicy",
+		"Bypass",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		psEchoHello,
+	}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandDoesNotDuplicateCommandFlag(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("pwsh -NoProfile -Command", "echo hello")
+
+	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-Command", psEchoHello}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandDoesNotDuplicatePowerShellAliasFlag(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("pwsh -NoProfile -C", "echo hello")
+
+	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-C", psEchoHello}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandUsesNixShellCommandFlag(t *testing.T) {
+	cmd := value.BuildShellCommandForTest("nix-shell", "echo hello")
+
+	assert.Equal(t, []string{"--run", "echo hello"}, cmd.Args[1:])
+}
+
+func TestBuildShellCommandKeepsExistingShellPathWithSpaces(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shell dir")
+	require.NoError(t, os.MkdirAll(dir, 0750))
+	shellPath := filepath.Join(dir, "pwsh")
+	require.NoError(t, os.WriteFile(shellPath, []byte{}, 0600))
+
+	cmd := value.BuildShellCommandForTest(shellPath, "echo hello")
+
+	assert.Equal(t, shellPath, cmd.Path)
+	assert.Equal(t, []string{"-NoProfile", "-NonInteractive", "-Command", psEchoHello}, cmd.Args[1:])
+}
+
+func shellBaseNameForTest(path string) string {
+	name := filepath.Base(path)
+	name = strings.TrimSuffix(strings.ToLower(name), ".exe")
+	return name
+}

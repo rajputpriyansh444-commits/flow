@@ -1,0 +1,57 @@
+package cmd_test
+
+import (
+	"fmt"
+	"net"
+	"path/filepath"
+	"testing"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmd"
+	"github.com/rajputpriyansh444-commits/flow/internal/service/frontend"
+	"github.com/rajputpriyansh444-commits/flow/internal/test"
+	"github.com/stretchr/testify/require"
+)
+
+func TestServerCommand(t *testing.T) {
+	t.Run("StartServer", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		cancelWhenLogContains(t, th, "Server is starting")
+		listener, port := test.ReserveServerListener(t)
+		th.RunCommand(t, cmd.Server(frontend.WithListener(listener)), test.CmdTest{
+			Args:        []string{"server", fmt.Sprintf("--port=%s", port)},
+			ExpectedOut: []string{"Server is starting", port},
+		})
+
+	})
+	t.Run("StartServerWithConfig", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		listener, port := test.ReserveServerListener(t)
+		configFile := th.TempFile(t, "server-config.yaml", fmt.Appendf(nil, "host: 127.0.0.1\nport: %s\n", port))
+		cancelWhenLogContains(t, th, "Server is starting")
+		th.RunCommand(t, cmd.Server(frontend.WithListener(listener)), test.CmdTest{
+			Args:        []string{"server", "--config", configFile, "--flow-home", filepath.Dir(th.Config.Paths.DataDir)},
+			ExpectedOut: []string{port},
+		})
+	})
+	t.Run("PortInUse", func(t *testing.T) {
+		th := test.SetupCommand(t)
+		_, port := test.ReserveServerListener(t)
+		err := commandError(t, th, cmd.Server(), "server", "--host=127.0.0.1", "--port="+port)
+		require.ErrorContains(t, err, "--port")
+		require.ErrorContains(t, err, "FLOW_PORT")
+	})
+}
+
+func TestServerSecondInterruptTerminatesBlockedCleanup(t *testing.T) {
+	assertSecondInterruptTerminatesBlockedCleanup(t, "server", "Resource monitoring service stopped")
+}
+
+// findPort finds an available port.
+func findPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return fmt.Sprintf("%d", port)
+}

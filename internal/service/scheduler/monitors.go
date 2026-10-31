@@ -1,0 +1,89 @@
+package scheduler
+
+import (
+	"log/slog"
+	"time"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/eventstore"
+	"github.com/rajputpriyansh444-commits/flow/internal/license"
+	notificationmodel "github.com/rajputpriyansh444-commits/flow/internal/notification"
+	"github.com/rajputpriyansh444-commits/flow/internal/persis"
+	"github.com/rajputpriyansh444-commits/flow/internal/service/chatbridge"
+	incidentservice "github.com/rajputpriyansh444-commits/flow/internal/service/incident"
+	notificationservice "github.com/rajputpriyansh444-commits/flow/internal/service/notification"
+)
+
+func newNotificationMonitor(cfg *config.Config, deps Dependencies) *chatbridge.NotificationMonitor {
+	if deps.NotificationStore == nil || deps.NotificationState == nil {
+		return nil
+	}
+	var lease chatbridge.Lease
+	if deps.NewNotificationLease != nil {
+		lease = deps.NewNotificationLease()
+	}
+	service := newNotificationService(cfg, deps.NotificationStore, deps.DAGRepository, deps.DAGRunRepository)
+	return chatbridge.NewNotificationMonitor(
+		deps.EventService,
+		deps.NotificationState,
+		lease,
+		service,
+		slog.Default(),
+		chatbridge.DefaultNotificationMonitorConfig(),
+	)
+}
+
+func newNotificationService(
+	cfg *config.Config,
+	store notificationmodel.Store,
+	dagRepository *persis.DAGRepository,
+	dagRunRepository *persis.DAGRunRepository,
+	opts ...notificationservice.Option,
+) *notificationservice.Service {
+	base := []notificationservice.Option{
+		notificationservice.WithPublicURL(cfg.Server.PublicURL),
+	}
+	// Command channels run shell commands, so they need the same server
+	// permissions as writing and running DAGs.
+	if cfg.Server.Permissions[config.PermissionWriteDAGs] && cfg.Server.Permissions[config.PermissionRunDAGs] {
+		base = append(base, notificationservice.WithCommandChannels(cfg.Core.BaseEnv.WithoutCredentials(), dagRunRepository))
+	}
+	return notificationservice.New(store, dagRepository, append(base, opts...)...)
+}
+
+func newIncidentMonitor(cfg *config.Config, deps Dependencies) *chatbridge.NotificationMonitor {
+	if deps.IncidentStore == nil || deps.IncidentState == nil {
+		return nil
+	}
+	var lease chatbridge.Lease
+	if deps.NewIncidentLease != nil {
+		lease = deps.NewIncidentLease()
+	}
+	var checker license.Checker
+	if deps.LicenseManager != nil {
+		checker = deps.LicenseManager.Checker()
+	}
+	service := incidentservice.New(
+		deps.IncidentStore,
+		incidentservice.WithIncidentsEnabled(func() bool {
+			return license.HasActiveLicense(checker)
+		}),
+		incidentservice.WithPublicURL(cfg.Server.PublicURL),
+	)
+	monitorConfig := chatbridge.DefaultNotificationMonitorConfig()
+	monitorConfig.UrgentWindow = time.Second
+	monitorConfig.SuccessWindow = time.Second
+	monitorConfig.InterestedEventTypes = []eventstore.EventType{
+		eventstore.TypeDAGRunFailed,
+		eventstore.TypeDAGRunSucceeded,
+		eventstore.TypeDAGRunPartiallySucceeded,
+	}
+	return chatbridge.NewNotificationMonitor(
+		deps.EventService,
+		deps.IncidentState,
+		lease,
+		service,
+		slog.Default(),
+		monitorConfig,
+	)
+}

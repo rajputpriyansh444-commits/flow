@@ -1,0 +1,60 @@
+package runctx
+
+import (
+	"context"
+	"path/filepath"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/runenv"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/config"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+	"github.com/rajputpriyansh444-commits/flow/internal/workspace"
+)
+
+// buildManagedDAGRunEnvs returns the environment variables Flow generates for a
+// dag-run. Keys whose value is unavailable are omitted rather than set empty.
+func buildManagedDAGRunEnvs(
+	ctx context.Context,
+	dag *ir.DAG,
+	dagRunID string,
+	logFile string,
+	options *contextOptions,
+) map[string]string {
+	envs := map[string]string{
+		runenv.EnvKeyDAGRunLogFile: logFile,
+		runenv.EnvKeyDAGRunID:      dagRunID,
+		runenv.EnvKeyDAGName:       dag.Name,
+	}
+	if wikiDir := dagWikiDir(ctx, dag); wikiDir != "" {
+		envs[runenv.EnvKeyDAGWikiDir] = wikiDir
+		envs[runenv.EnvKeyDAGDocsDir] = wikiDir
+	}
+	if options.workDir != "" {
+		envs[runenv.EnvKeyDAGRunWorkDir] = options.workDir
+	}
+	if options.artifactDir != "" {
+		envs[runenv.EnvKeyDAGRunArtifactsDir] = options.artifactDir
+	}
+	paramsJSON := dag.ParamsJSON
+	if options.paramsJSON != nil {
+		paramsJSON = *options.paramsJSON
+	}
+	if paramsJSON != "" {
+		envs[runenv.EnvKeyDAGParamsJSON] = paramsJSON
+		envs[runenv.EnvKeyDAGParamsJSONCompat] = paramsJSON
+	}
+	return envs
+}
+
+// dagWikiDir returns the Wiki directory for the DAG, or an empty string
+// when no Wiki root is configured.
+func dagWikiDir(ctx context.Context, dag *ir.DAG) string {
+	cfg := config.GetConfig(ctx)
+	if cfg.Paths.WikiDir == "" {
+		return ""
+	}
+	if workspaceName, ok := workspace.WorkspaceNameFromLabels(dag.Labels); ok {
+		return filepath.Join(cfg.Paths.WikiDir, workspaceName, dag.Name)
+	}
+	return filepath.Join(cfg.Paths.WikiDir, dag.Name)
+}

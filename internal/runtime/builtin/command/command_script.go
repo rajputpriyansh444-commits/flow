@@ -1,0 +1,201 @@
+package command
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/cmdutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/cmn/fileutil"
+	"github.com/rajputpriyansh444-commits/flow/internal/ir"
+)
+
+// setupScript creates a temporary executable script file containing the provided script.
+func setupScript(workDir, script, command string, shell []string) (string, error) {
+	return setupScriptForExecution(workDir, script, command, shell, false)
+}
+
+func setupScriptForExecution(workDir, script, command string, shell []string, userSpecifiedShell bool) (string, error) {
+	// Determine file extension based on the actual execution path. Scripts that
+	// are passed to an explicit command or directly to a shebang interpreter should
+	// preserve their original first line so the intended interpreter can handle them.
+	shellCmd := ""
+	if command == "" && len(shell) > 0 && (userSpecifiedShell || !hasShebang(script)) {
+		shellCmd = shell[0]
+	}
+	ext := cmdutil.GetScriptExtension(shellCmd)
+	pattern := "flow_script-*" + ext
+
+	file, err := createScriptTemp(workDir, pattern)
+	if err != nil {
+		return "", fmt.Errorf("failed to create script file: %w", err)
+	}
+
+	// cleanup removes the temp file on error
+	cleanup := func() {
+		_ = file.Close()
+		_ = fileutil.Remove(file.Name())
+	}
+
+	// Apply shell-specific preprocessing
+	script = preprocessScript(script, ext)
+
+	if _, err = file.WriteString(script); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to write script to file: %w", err)
+	}
+
+	if err = file.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to sync script file: %w", err)
+	}
+
+	// Add execute permissions to the script file
+	if err = os.Chmod(file.Name(), 0750); err != nil { // nolint: gosec
+		cleanup()
+		return "", fmt.Errorf("failed to set execute permissions on script file: %w", err)
+	}
+
+	_ = file.Close()
+	return file.Name(), nil
+}
+
+func createScriptTemp(workDir, pattern string) (*os.File, error) {
+	file, err := os.CreateTemp("", pattern)
+	if err == nil {
+		return file, nil
+	}
+	return createScriptTempFallback(workDir, pattern, err)
+}
+
+func createScriptTempFallback(workDir, pattern string, systemTempErr error) (*os.File, error) {
+	if strings.TrimSpace(workDir) == "" {
+		return nil, fmt.Errorf("system temp unavailable: %w", systemTempErr)
+	}
+
+	fallbackDir := filepath.Join(workDir, ".flow", "tmp", "scripts")
+	if err := os.MkdirAll(fallbackDir, 0o700); err != nil {
+		return nil, fmt.Errorf(
+			"system temp unavailable: %w; fallback %q unavailable: %v",
+			systemTempErr, fallbackDir, err,
+		)
+	}
+
+	file, err := os.CreateTemp(fallbackDir, pattern)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"system temp unavailable: %w; fallback %q failed: %v",
+			systemTempErr, fallbackDir, err,
+		)
+	}
+	return file, nil
+}
+
+// utf8BOM is the UTF-8 byte order mark. Windows PowerShell decodes a script file
+// without one using the ANSI code page, which corrupts non-ASCII script text
+// before the UTF-8 preamble below can run.
+const utf8BOM = "\xEF\xBB\xBF"
+
+func hasShebang(script string) bool {
+	return strings.HasPrefix(script, "#!")
+}
+
+// powerShellPreambleStatements run before every PowerShell script and inline
+// command. The first statement imports the two core modules by name. Without
+// it, the first unknown cmdlet (the preamble's own New-Object, or Set-Content
+// in a user script) makes Windows PowerShell discover the module through
+// command auto-discovery, which analyzes every module on PSModulePath when the
+// module analysis cache is cold: each module is imported, or its assembly is
+// loaded in a throwaway AppDomain, before the script's first line runs. On a
+// fresh machine that takes tens of seconds; a short-lived process never saves
+// the cache, so it pays again every time. Importing by name skips discovery
+// and costs a few milliseconds in both Windows PowerShell and pwsh, where the
+// modules are already loaded.
+var powerShellPreambleStatements = []string{
+	cmdutil.PowerShellImportCoreModules,
+	"$ErrorActionPreference = 'Stop'",
+	"$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false",
+	"[Console]::InputEncoding = $utf8NoBom",
+	"[Console]::OutputEncoding = $utf8NoBom",
+	"$OutputEncoding = $utf8NoBom",
+}
+
+func powerShellPreamble() string {
+	return strings.Join(powerShellPreambleStatements, "\n")
+}
+
+func powerShellInlineCommand(command string) string {
+	parts := append([]string{}, powerShellPreambleStatements...)
+	command = strings.TrimSpace(command)
+	if command != "" {
+		parts = append(parts, command)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// scriptLineOffset returns the number of lines prepended by preprocessScript
+// for the given shell. This is needed to map error line numbers back to the
+// user's original script content.
+func scriptLineOffset(scriptFile string) int {
+	if scriptFile == "" {
+		return 0
+	}
+	if cmdutil.GetScriptExtension(scriptFile) == ".ps1" {
+		return len(powerShellPreambleStatements)
+	}
+	return 0
+}
+
+// preprocessScript returns the script content adjusted for the shell indicated by ext.
+// For ".ps1" it prefixes a UTF-8 byte order mark so Windows PowerShell reads the
+// file as UTF-8 regardless of the console code page, then prepends PowerShell
+// directives that make cmdlet errors stop execution and normalize UTF-8
+// console/pipeline encoding; for other extensions it returns the original script.
+func preprocessScript(script, ext string) string {
+	switch ext {
+	case ".ps1":
+		// The BOM precedes the preamble so scriptLineOffset still counts only
+		// the prepended statements. pwsh accepts the BOM as well.
+		return utf8BOM + powerShellPreamble() + "\n" + script
+	default:
+		return script
+	}
+}
+
+// createDirectCommand returns an *exec.Cmd that invokes cmd with the provided args.
+// If scriptFile is non-empty it is appended to the argument list. The returned command
+// is bound to ctx.
+func createDirectCommand(ctx context.Context, cmd string, args []string, scriptFile string) *exec.Cmd {
+	clonedArgs := cloneArgs(args)
+	if scriptFile != "" {
+		clonedArgs = append(clonedArgs, scriptFile)
+	}
+	command := exec.CommandContext(ctx, cmdutil.ResolveExecutable(cmd), clonedArgs...) // nolint: gosec
+	cmdutil.SetupCommand(command)
+	return command
+}
+
+// validateCommandStep checks that a Step has a valid command configuration.
+// It considers a step valid when it provides Commands, a Script, both, or a non-nil SubDAG.
+// Returns ir.ErrStepCommandIsRequired when none of those are present.
+func validateCommandStep(step ir.Step) error {
+	hasCommands := len(step.Commands) > 0
+
+	switch {
+	case hasCommands && step.Script != "":
+		// Both commands and script provided - valid
+	case hasCommands && step.Script == "":
+		// Commands only - valid
+	case !hasCommands && step.Script != "":
+		// Script only - valid
+	case step.SubDAG != nil:
+		// Sub DAG - valid
+	default:
+		return ir.NewValidationError("command", nil, ir.ErrStepCommandIsRequired)
+	}
+
+	return nil
+}
