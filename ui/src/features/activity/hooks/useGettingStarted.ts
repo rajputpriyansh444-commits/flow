@@ -1,14 +1,9 @@
 import { useContext, useEffect } from 'react';
 import { AppBarContext } from '@/contexts/AppBarContext';
-import {
-  useCanManageNotifications,
-  useCanWrite,
-  useIsAdmin,
-} from '@/contexts/AuthContext';
+import { useCanManageNotifications, useCanWrite } from '@/contexts/AuthContext';
 import { useQuery } from '@/hooks/api';
 import { useLicenseState } from '@/hooks/useLicense';
 import { useStoredValue } from '@/hooks/useStoredValue';
-import { isLicenseManagedByEnv } from '@/lib/license';
 import { WorkspaceKind } from '@/lib/workspace';
 import {
   DAG_SAMPLE_SIZE,
@@ -25,7 +20,7 @@ export type GettingStartedStep =
   | { id: 'run'; done: boolean; exampleFile?: string }
   | { id: 'create'; done: boolean }
   | { id: 'schedule'; done: boolean }
-  | { id: 'alert'; done: boolean; canConnect: boolean; canAddChannel: boolean };
+  | { id: 'alert'; done: boolean };
 
 export type GettingStarted =
   | { status: 'hidden' | 'pending' }
@@ -44,7 +39,6 @@ export function useGettingStarted(): GettingStarted {
   const { selectedRemoteNode } = useContext(AppBarContext);
   const remoteNode = selectedRemoteNode || 'local';
   const canWrite = useCanWrite();
-  const isAdmin = useIsAdmin();
   const canAddChannel = useCanManageNotifications();
   const { license, loading, error: licenseError } = useLicenseState();
   const [stored, setStored] = useStoredValue(
@@ -52,8 +46,6 @@ export function useGettingStarted(): GettingStarted {
   );
   const active = canWrite && stored !== DISMISSED && stored !== DONE;
   const community = license.community;
-  const canConnect = isAdmin && community && !isLicenseManagedByEnv(license);
-  const hasAlertStep = canConnect || canAddChannel;
 
   const { data: sample, error: sampleError } = useQuery(
     '/dags',
@@ -119,8 +111,8 @@ export function useGettingStarted(): GettingStarted {
       { id: 'create', done: progress.created },
       { id: 'schedule', done: scheduled },
     ];
-    if (hasAlertStep) {
-      steps.push({ id: 'alert', done: alerted, canConnect, canAddChannel });
+    if (canAddChannel) {
+      steps.push({ id: 'alert', done: alerted });
     }
     if (stored !== STARTED) {
       // A server already in use when first seen never needs the checklist.

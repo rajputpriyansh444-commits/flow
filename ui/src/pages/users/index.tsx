@@ -1,4 +1,3 @@
-import { LicenseFeaturePrompt } from '@/components/LicenseFeaturePrompt';
 import { components, UserAuthProvider } from '@/api/v1/schema';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -262,15 +261,6 @@ export default function UsersPage() {
       {error && (
         <div className="p-3 text-sm text-destructive bg-destructive/10 rounded-md">
           {error}
-        </div>
-      )}
-
-      {!hasRbac && (
-        <div className="space-y-2">
-          <LicenseFeaturePrompt feature="rbac" inline />
-          <p className="text-xs text-muted-foreground">
-            <I18nText text="Password reset remains available to administrators." />
-          </p>
         </div>
       )}
 

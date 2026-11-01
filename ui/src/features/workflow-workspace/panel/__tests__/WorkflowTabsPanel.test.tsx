@@ -345,7 +345,7 @@ describe('WorkflowTabsPanel', () => {
       within(tablist())
         .getAllByRole('tab')
         .map((t) => t.textContent)
-    ).toEqual(['Overview', 'Wiki', 'Incidents', 'Notifications']);
+    ).toEqual(['Overview', 'Wiki', 'Notifications']);
     expect(tab('Overview')).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText('overview body')).toBeVisible();
     expect(screen.getByRole('tabpanel', { name: 'Overview' })).toBeVisible();
@@ -363,7 +363,7 @@ describe('WorkflowTabsPanel', () => {
 
   // parity:test-wiki-tab parity:wiki-list parity:wiki-new-runbook
   // parity:shell-wiki-tab-hidden-on-page
-  it('mounts the wiki, notifications and incidents tabs', async () => {
+  it('mounts the wiki and notifications tabs', async () => {
     const user = userEvent.setup();
     renderAt(['/dags/nightly.yaml']);
 
@@ -373,22 +373,11 @@ describe('WorkflowTabsPanel', () => {
       (await screen.findAllByText(/ops workspace rules/)).length
     ).toBeGreaterThan(0);
 
-    await user.click(tab('Incidents'));
-    expect(await screen.findByText('Workflow incidents')).toBeVisible();
-
     await user.click(tab('Wiki'));
     await user.click(
       await screen.findByRole('button', { name: 'New runbook' })
     );
     expect(screen.getByTestId('create-wiki-page')).toBeInTheDocument();
-  });
-
-  it('gates the incidents tab behind the license', async () => {
-    renderAt(['/dags/nightly.yaml?wtab=incidents'], { licensed: false });
-
-    expect(await screen.findByTestId('license-prompt')).toHaveTextContent(
-      'incidents'
-    );
   });
 
   // The runtime profile is a section of the Overview tab. The old Profile tab
@@ -462,9 +451,8 @@ describe('WorkflowTabsPanel', () => {
       'false',
       'true',
       'false',
-      'false',
     ]);
-    expect(tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1, -1]);
+    expect(tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1]);
     const panel = screen.getByRole('tabpanel', { name: 'Wiki' });
     expect(tabs[1]).toHaveAttribute('aria-controls', panel.id);
   });

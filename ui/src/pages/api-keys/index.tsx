@@ -1,5 +1,4 @@
-import { Link } from 'react-router-dom';
-import { hasActiveLicense, isFreeLicense } from '@/lib/license';
+import { hasActiveLicense } from '@/lib/license';
 import { components } from '@/api/v1/schema';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -69,7 +68,6 @@ export default function APIKeysPage() {
   const activeLicense = hasActiveLicense(license);
   const communityLimitReached =
     !activeLicense && apiKeys.length >= COMMUNITY_API_KEY_LIMIT;
-  const freePlan = isFreeLicense(license);
 
   // Set page title
   useEffect(() => {
@@ -182,28 +180,15 @@ export default function APIKeysPage() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <p className="font-medium">
-              <I18nText
-                text={
-                  freePlan
-                    ? 'The Free plan supports up to 2 API keys.'
-                    : 'Community installs can manage up to 2 API keys.'
-                }
-              />
+              <I18nText text={'Flow supports up to 2 API keys.'} />
             </p>
             <p className="mt-1">
               <I18nText
                 text={
-                  freePlan
-                    ? 'Existing keys remain active. Revoke a key to create another, or move to Team or Pro to remove the limit.'
-                    : 'Existing keys remain active, but new key creation is blocked until extra keys are revoked or a license is configured.'
+                  'Existing keys remain active. Revoke a key to create another.'
                 }
               />
             </p>
-            {isAdmin && (
-              <Link to="/license" className="mt-2 inline-block underline">
-                <I18nText text="Plan & features" />
-              </Link>
-            )}
           </div>
         </div>
       )}

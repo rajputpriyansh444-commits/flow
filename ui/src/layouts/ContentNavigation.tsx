@@ -27,9 +27,6 @@ const STATIC_ROUTE_LABELS: Record<string, TranslationKey> = {
   '/notifications': 'navigation.notifications',
   '/notification-rules': 'navigation.notificationRules',
   '/notification-channels': 'navigation.notificationChannels',
-  '/incidents': 'navigation.incidents',
-  '/incident-providers': 'navigation.incidentConnections',
-  '/incident-policies': 'navigation.incidentRouting',
   '/dags': 'navigation.workflows',
   '/search': 'navigation.search',
   '/base-config': 'navigation.baseConfig',
@@ -45,8 +42,6 @@ const STATIC_ROUTE_LABELS: Record<string, TranslationKey> = {
   '/webhooks': 'navigation.webhooks',
   '/terminal': 'navigation.terminal',
   '/event-logs': 'navigation.events',
-  '/audit-logs': 'navigation.auditLogs',
-  '/license': 'navigation.license',
   '/git-sync': 'navigation.gitSync',
 };
 
@@ -166,7 +161,6 @@ export function getBreadcrumbItems(
       'remote-nodes',
       'api-keys',
       'terminal',
-      'license',
       'git-sync',
     ].includes(segments[0] ?? '')
   ) {
@@ -186,9 +180,7 @@ export function getBreadcrumbItems(
     return items;
   }
 
-  if (
-    ['system-status', 'event-logs', 'audit-logs'].includes(segments[0] ?? '')
-  ) {
+  if (['system-status', 'event-logs'].includes(segments[0] ?? '')) {
     items.push({ label: t('navigation.monitor'), to: '/system-status' });
     items.push({
       label:
@@ -227,24 +219,6 @@ export function getBreadcrumbItems(
         label: t('navigation.notifications'),
         to: '/notifications',
       });
-    }
-    items.push({
-      label:
-        (STATIC_ROUTE_LABELS[normalized]
-          ? t(STATIC_ROUTE_LABELS[normalized])
-          : undefined) ?? humanizePathSegment(segments[0] ?? ''),
-      to: normalized,
-    });
-    return items;
-  }
-
-  if (
-    ['incidents', 'incident-providers', 'incident-policies'].includes(
-      segments[0] ?? ''
-    )
-  ) {
-    if (normalized !== '/incidents') {
-      items.push({ label: t('navigation.incidents'), to: '/incidents' });
     }
     items.push({
       label:

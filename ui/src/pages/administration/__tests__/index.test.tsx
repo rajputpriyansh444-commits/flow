@@ -54,9 +54,6 @@ describe('AdministrationPage', () => {
       screen.getByText('Configure distributed execution targets.')
     ).toBeVisible();
     expect(screen.getByText('Open a server-side shell.')).toBeVisible();
-    expect(
-      screen.getByText('License, Flow Console connection, and monitoring.')
-    ).toBeVisible();
     expect(setTitle).toHaveBeenCalledWith('Administration');
   });
 });

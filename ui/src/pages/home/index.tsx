@@ -3,13 +3,11 @@ import {
   useAuth,
   useCanAccessSystemStatus,
   useCanManageWebhooks,
-  useCanViewAuditLogs,
   useCanViewEventLogs,
   useIsAdmin,
 } from '@/contexts/AuthContext';
 import { AppBarContext } from '@/contexts/AppBarContext';
 import { useConfig } from '@/contexts/ConfigContext';
-import { useHasFeature } from '@/hooks/useLicense';
 import { useI18n } from '@/i18n/I18nProvider';
 import { roleAtLeast } from '@/lib/workspaceAccess';
 import { UserRole } from '@/api/v1/schema';
@@ -63,7 +61,6 @@ export default function HomePage(): React.ReactElement {
   const config = useConfig();
   const { user } = useAuth();
   const isAdmin = useIsAdmin();
-  const hasAudit = useHasFeature('audit');
   const canWrite =
     config.authMode !== 'builtin'
       ? config.permissions.writeDags
@@ -71,7 +68,6 @@ export default function HomePage(): React.ReactElement {
   const canAccessSystemStatus = useCanAccessSystemStatus();
   const canManageWebhooks = useCanManageWebhooks();
   const canViewEventLogs = useCanViewEventLogs();
-  const canViewAuditLogs = useCanViewAuditLogs();
 
   React.useEffect(() => {
     setTitle(t('navigation.home'));
@@ -169,17 +165,6 @@ export default function HomePage(): React.ReactElement {
                 to: '/event-logs',
                 label: t('navigation.events'),
                 description: t('home.eventsDescription'),
-              },
-            ]
-          : []),
-        ...(canViewAuditLogs
-          ? [
-              {
-                to: '/audit-logs',
-                label: hasAudit
-                  ? t('navigation.auditLogs')
-                  : t('home.auditLogsPro'),
-                description: t('home.auditLogsDescription'),
               },
             ]
           : []),

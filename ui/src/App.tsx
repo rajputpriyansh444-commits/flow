@@ -8,9 +8,6 @@ import {
 } from 'react-router-dom';
 import { SWRConfig, mutate as globalMutate } from 'swr';
 
-import { LicenseFeaturePrompt } from '@/components/LicenseFeaturePrompt';
-import { hasActiveLicense, type LicensedFeature } from '@/lib/license';
-
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { QueryFeedback } from './components/QueryFeedback';
 import { ErrorModalProvider } from '@/components/ui/error-modal';
@@ -21,7 +18,6 @@ import LegacyRunRedirect from './pages/dag-runs/LegacyRunRedirect';
 import { AppBarContext } from './contexts/AppBarContext';
 import { AuthProvider, useCanAccessGitSync } from './contexts/AuthContext';
 import { Config, ConfigContext } from './contexts/ConfigContext';
-import { useHasFeature, useLicense } from './hooks/useLicense';
 import { SchemaProvider } from './contexts/SchemaContext';
 import { SearchStateProvider } from './contexts/SearchStateContext';
 import {
@@ -55,7 +51,6 @@ const AdministrationPage = React.lazy(() => import('./pages/administration'));
 const APIKeysPage = React.lazy(() => import('./pages/api-keys'));
 const APIDocsPage = React.lazy(() => import('./pages/api-docs'));
 const ArtifactsPage = React.lazy(() => import('./pages/artifacts'));
-const AuditLogsPage = React.lazy(() => import('./pages/audit-logs'));
 const BaseConfigPage = React.lazy(() => import('./pages/base-config'));
 const DAGRuns = React.lazy(() => import('./pages/dag-runs'));
 const DAGs = React.lazy(() => import('./pages/dags'));
@@ -64,15 +59,7 @@ const WikiPage = React.lazy(() => import('./pages/wiki'));
 const EventLogsPage = React.lazy(() => import('./pages/event-logs'));
 const GitSyncPage = React.lazy(() => import('./pages/git-sync'));
 const HomePage = React.lazy(() => import('./pages/home'));
-const IncidentPoliciesPage = React.lazy(
-  () => import('./pages/incident-policies')
-);
-const IncidentProvidersPage = React.lazy(
-  () => import('./pages/incident-providers')
-);
-const IncidentsPage = React.lazy(() => import('./pages/incidents'));
 const IntegrationsPage = React.lazy(() => import('./pages/integrations'));
-const LicensePage = React.lazy(() => import('./pages/license'));
 const NotFoundPage = React.lazy(() => import('./pages/not-found'));
 const NotificationChannelsPage = React.lazy(
   () => import('./pages/notification-channels')
@@ -229,36 +216,6 @@ function DeveloperElement({
     <ProtectedRoute requiredRole={UserRole.developer}>
       {children}
     </ProtectedRoute>
-  );
-}
-
-function LicensedRoute({
-  feature,
-  children,
-}: {
-  feature: LicensedFeature;
-  children: React.ReactElement;
-}): React.ReactElement {
-  const hasFeature = useHasFeature(feature);
-  if (hasFeature) return children;
-  return <LicenseFeaturePrompt feature={feature} headingLevel={1} />;
-}
-
-function ActiveLicenseDeveloperElement({
-  children,
-}: {
-  children: React.ReactElement;
-}): React.ReactElement {
-  const license = useLicense();
-  const licensed = hasActiveLicense(license);
-  return (
-    <DeveloperElement>
-      {licensed ? (
-        children
-      ) : (
-        <LicenseFeaturePrompt feature="incidents" headingLevel={1} />
-      )}
-    </DeveloperElement>
   );
 }
 
@@ -717,30 +674,6 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                           </DeveloperElement>
                                         }
                                       />
-                                      <Route
-                                        path="/incidents"
-                                        element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentsPage />
-                                          </ActiveLicenseDeveloperElement>
-                                        }
-                                      />
-                                      <Route
-                                        path="/incident-providers"
-                                        element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentProvidersPage />
-                                          </ActiveLicenseDeveloperElement>
-                                        }
-                                      />
-                                      <Route
-                                        path="/incident-policies"
-                                        element={
-                                          <ActiveLicenseDeveloperElement>
-                                            <IncidentPoliciesPage />
-                                          </ActiveLicenseDeveloperElement>
-                                        }
-                                      />
                                       <Route path="/dags/" element={<DAGs />} />
                                       <Route
                                         path="/dags/:fileName/:tab"
@@ -869,26 +802,6 @@ function AppInner({ config: initialConfig }: Props): React.ReactElement {
                                           <ManagerElement>
                                             <EventLogsPage />
                                           </ManagerElement>
-                                        }
-                                      />
-                                      <Route
-                                        path="/audit-logs"
-                                        element={
-                                          <ManagerElement>
-                                            <LicensedRoute feature="audit">
-                                              <AuditLogsPage />
-                                            </LicensedRoute>
-                                          </ManagerElement>
-                                        }
-                                      />
-                                      <Route
-                                        path="/license"
-                                        element={
-                                          <AdminElement>
-                                            <LicensePage
-                                              key={selectedRemoteNode}
-                                            />
-                                          </AdminElement>
                                         }
                                       />
                                       <Route

@@ -296,10 +296,7 @@ describe('sidebar menu', () => {
     expectLinks(screen.getByRole('group', { name: 'Monitor' }), [
       ['System Status', '/system-status'],
       ['Events', '/event-logs'],
-      ['Audit Logs', '/audit-logs'],
       ['Notifications', '/notifications'],
-      ['Incidents', '/incidents'],
-      ['External Monitoring', '/license#monitoring'],
     ]);
     expectLinks(screen.getByRole('group', { name: 'Configure' }), [
       ['Profiles & Secrets', '/profiles'],
@@ -713,7 +710,6 @@ describe('sidebar menu', () => {
     ['/event-logs', 'Events'],
     ['/notification-rules', 'Notifications'],
     ['/notification-channels', 'Notifications'],
-    ['/incident-policies', 'Incidents'],
     ['/webhooks', 'Webhooks'],
     ['/users', 'Users'],
   ])('marks %s as the active entry', (path, label) => {
@@ -723,20 +719,5 @@ describe('sidebar menu', () => {
       'aria-current',
       'page'
     );
-  });
-
-  it('does not append Pro labels to unavailable sidebar features', () => {
-    useHasFeatureMock.mockReturnValue(false);
-
-    renderMenu();
-
-    expect(screen.getByRole('link', { name: 'Audit Logs' })).toBeVisible();
-    expect(
-      screen.queryByRole('link', { name: 'Audit Logs (Pro)' })
-    ).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Users' })).toBeVisible();
-    expect(
-      screen.queryByRole('link', { name: 'Users (Pro)' })
-    ).not.toBeInTheDocument();
   });
 });

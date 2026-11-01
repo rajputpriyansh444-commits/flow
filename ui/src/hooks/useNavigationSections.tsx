@@ -1,9 +1,7 @@
 import {
   Activity,
-  AlertTriangle,
   Bell,
   BookOpen,
-  ClipboardList,
   FileCode2,
   FileCog,
   Gauge,
@@ -13,7 +11,6 @@ import {
   Layers,
   Network,
   Package,
-  Radar,
   ScrollText,
   Server,
   SlidersHorizontal,
@@ -29,7 +26,6 @@ import {
   useCanAccessSystemStatus,
   useCanManageProfiles,
   useCanManageWebhooks,
-  useCanViewAuditLogs,
   useCanViewEventLogs,
   useIsAdmin,
 } from '@/contexts/AuthContext';
@@ -72,13 +68,11 @@ export function useNavigationSections(): {
     config.authMode !== 'builtin'
       ? config.permissions.writeDags
       : roleAtLeast(user?.role ?? null, UserRole.developer);
-  const canManageIncidents = canManageNotifications;
   const canAccessSystemStatus = useCanAccessSystemStatus();
   const canAccessGitSync = useCanAccessGitSync();
   const canManageWebhooks = useCanManageWebhooks();
   const canManageProfiles = useCanManageProfiles();
   const canViewEventLogs = useCanViewEventLogs();
-  const canViewAuditLogs = useCanViewAuditLogs();
   const { t } = useI18n();
 
   const mainItems: NavigationLink[] = [
@@ -126,11 +120,6 @@ export function useNavigationSections(): {
           text: t('navigation.events'),
           icon: <ScrollText size={16} />,
         },
-        canViewAuditLogs && {
-          to: '/audit-logs',
-          text: t('navigation.auditLogs'),
-          icon: <ClipboardList size={16} />,
-        },
         canManageNotifications && {
           to: '/notifications',
           text: t('navigation.notifications'),
@@ -140,21 +129,6 @@ export function useNavigationSections(): {
             '/notification-rules',
             '/notification-channels',
           ],
-        },
-        canManageIncidents && {
-          to: '/incidents',
-          text: t('navigation.incidents'),
-          icon: <AlertTriangle size={16} />,
-          activePaths: [
-            '/incidents',
-            '/incident-providers',
-            '/incident-policies',
-          ],
-        },
-        isAdmin && {
-          to: '/license#monitoring',
-          text: t('navigation.externalMonitoring'),
-          icon: <Radar size={16} />,
         },
       ],
     },

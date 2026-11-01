@@ -157,7 +157,7 @@ describe('APIKeysPage', () => {
     });
 
     expect(
-      await screen.findByText(/Community installs can manage up to 2 API keys/i)
+      await screen.findByText(/Flow supports up to 2 API keys/i)
     ).toBeVisible();
     expect(
       screen.getByRole('button', { name: /create api key/i })
@@ -182,32 +182,11 @@ describe('APIKeysPage', () => {
     });
 
     expect(
-      screen.queryByText(/Community installs can manage up to 2 API keys/i)
+      screen.queryByText(/Flow supports up to 2 API keys/i)
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /create api key/i })
     ).toBeEnabled();
-  });
-
-  it('names the free plan when it reaches 2 API keys', async () => {
-    renderPage({
-      license: {
-        valid: true,
-        plan: 'free',
-        features: [],
-        community: false,
-        source: 'file',
-      },
-      apiKeys: [makeAPIKey('1'), makeAPIKey('2')],
-    });
-
-    expect(
-      await screen.findByText('The Free plan supports up to 2 API keys.')
-    ).toBeVisible();
-    expect(screen.getByText(/Revoke a key to create another/)).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: /create api key/i })
-    ).toBeDisabled();
   });
 
   it('warns when an inactive loaded license reaches 2 API keys', async () => {
@@ -223,7 +202,7 @@ describe('APIKeysPage', () => {
     });
 
     expect(
-      await screen.findByText(/Community installs can manage up to 2 API keys/i)
+      await screen.findByText(/Flow supports up to 2 API keys/i)
     ).toBeVisible();
   });
 });

@@ -7,7 +7,6 @@ import { useI18n } from '@/i18n/I18nProvider';
 import { cn } from '@/lib/utils';
 import type { GettingStartedStep } from '../hooks/useGettingStarted';
 
-
 const STEP_TITLES: Record<GettingStartedStep['id'], string> = {
   run: 'Run a workflow',
   create: 'Create your own workflow',
@@ -26,9 +25,7 @@ function stepDetail(step: GettingStartedStep): string {
     case 'schedule':
       return 'A schedule runs a workflow while no one is watching.';
     case 'alert':
-      return step.canConnect
-        ? 'Get an email from Flow Console when a workflow fails or this server stops, or send failures to a notification channel.'
-        : 'Send failures to Slack, email, or a webhook.';
+      return 'Send failures to Slack, email, or a webhook.';
   }
 }
 
@@ -49,20 +46,11 @@ function StepActions({ step }: { step: GettingStartedStep }) {
       return null;
     case 'alert':
       return (
-        <>
-          {step.canConnect && (
-            <Button asChild variant="outline">
-              <Link to="/license#monitoring">{ts('Connect for free')}</Link>
-            </Button>
-          )}
-          {step.canAddChannel && (
-            <Button asChild variant="outline">
-              <Link to="/notification-channels">
-                {ts('Add a notification channel')}
-              </Link>
-            </Button>
-          )}
-        </>
+        <Button asChild variant="outline">
+          <Link to="/notification-channels">
+            {ts('Add a notification channel')}
+          </Link>
+        </Button>
       );
   }
 }

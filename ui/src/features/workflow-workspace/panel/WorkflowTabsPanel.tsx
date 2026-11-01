@@ -1,13 +1,6 @@
-import {
-  AlertTriangle,
-  Bell,
-  BookOpen,
-  LayoutList,
-  type LucideIcon,
-} from 'lucide-react';
+import { Bell, BookOpen, LayoutList, type LucideIcon } from 'lucide-react';
 import { useEffect, useMemo, type ReactNode } from 'react';
 import DAGWikiTab from '@/features/dags/components/dag-details/DAGWikiTab';
-import IncidentsTab from '@/features/dags/components/dag-details/IncidentsTab';
 import NotificationsTab from '@/features/dags/components/dag-details/NotificationsTab';
 import { TabStrip, tabStripTabId } from '@/components/ui/tab-strip';
 import { PANEL_BODY_CLASS } from '@/features/dags/components/step-details/PanelShell';
@@ -29,7 +22,6 @@ export interface WorkflowTabInfo {
 export const WORKFLOW_TABS: readonly WorkflowTabInfo[] = [
   { id: 'overview', label: 'Overview', icon: LayoutList },
   { id: 'wiki', label: 'Wiki', icon: BookOpen },
-  { id: 'incidents', label: 'Incidents', icon: AlertTriangle },
   { id: 'notifications', label: 'Notifications', icon: Bell },
 ];
 
@@ -130,13 +122,6 @@ export function WorkflowTabsPanel({
         )}
         {tab === 'wiki' && (
           <DAGWikiTab dagName={dag.name} workspaceName={workspace} />
-        )}
-        {tab === 'incidents' && (
-          <IncidentsTab
-            fileName={fileName}
-            workspaceName={workspace}
-            onDirtyChange={(dirty) => setDirty('incidents', dirty)}
-          />
         )}
         {tab === 'notifications' && (
           <NotificationsTab

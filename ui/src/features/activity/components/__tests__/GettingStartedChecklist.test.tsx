@@ -13,7 +13,7 @@ const freshSteps: GettingStartedStep[] = [
   { id: 'run', done: false, exampleFile: 'example-06-retry-on-failure' },
   { id: 'create', done: false },
   { id: 'schedule', done: false },
-  { id: 'alert', done: false, canConnect: true, canAddChannel: true },
+  { id: 'alert', done: false },
 ];
 
 function renderChecklist(
@@ -63,9 +63,6 @@ describe('GettingStartedChecklist', () => {
     ).not.toBeInTheDocument();
     const alert = within(stepItem('Get alerted when something fails'));
     expect(
-      alert.getByRole('link', { name: 'Connect for free' })
-    ).toHaveAttribute('href', '/license#monitoring');
-    expect(
       alert.getByRole('link', { name: 'Add a notification channel' })
     ).toHaveAttribute('href', '/notification-channels');
   });
@@ -88,19 +85,6 @@ describe('GettingStartedChecklist', () => {
     const done = stepItem('Run a workflow');
     expect(done).toHaveTextContent('Run a workflow (Done)');
     expect(within(done).queryByRole('link')).not.toBeInTheDocument();
-  });
-
-  it('offers only the alert actions the user may take', () => {
-    renderChecklist([
-      { id: 'alert', done: false, canConnect: false, canAddChannel: true },
-    ]);
-
-    expect(
-      screen.queryByRole('link', { name: 'Connect for free' })
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole('link', { name: 'Add a notification channel' })
-    ).toBeVisible();
   });
 
   it('dismisses', () => {

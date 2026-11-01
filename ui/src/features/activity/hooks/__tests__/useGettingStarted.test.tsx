@@ -144,7 +144,7 @@ describe('useGettingStarted', () => {
         { id: 'run', done: false, exampleFile: 'example-06-retry-on-failure' },
         {},
         {},
-        { id: 'alert', canConnect: true, canAddChannel: true },
+        { id: 'alert' },
       ],
     });
     expect(stored()).toBe('started');

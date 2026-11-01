@@ -309,19 +309,6 @@ describe('App license routing', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('keeps incident management routes behind an active license', async () => {
-    renderAt('/incidents');
-
-    await waitFor(() => {
-      expect(
-        screen.getByRole('heading', { name: 'Incident routing' })
-      ).toBeVisible();
-    });
-    expect(
-      screen.queryByRole('heading', { name: 'Incidents' })
-    ).not.toBeInTheDocument();
-  });
-
   it('does not show the local license while a remote status is pending', async () => {
     const config = makeConfig({ remoteNodes: 'local,remote' });
     config.license = {
@@ -339,34 +326,6 @@ describe('App license routing', () => {
     );
     expect(screen.getByLabelText('Current license')).toHaveTextContent(
       'unavailable'
-    );
-  });
-
-  it('updates licensed routes from the live license status', async () => {
-    useQueryMock.mockReturnValue({
-      data: {
-        valid: true,
-        plan: 'pro',
-        expiry: '2027-01-01T00:00:00Z',
-        features: ['audit'],
-        gracePeriod: false,
-        graceEndsAt: '',
-        community: false,
-        source: 'file',
-        warningCode: '',
-        error: '',
-      },
-    });
-
-    renderAt('/incidents');
-
-    expect(
-      await screen.findByRole('heading', { name: 'Incidents' })
-    ).toBeVisible();
-    expect(useQueryMock).toHaveBeenCalledWith(
-      '/license/status',
-      { params: { query: { remoteNode: 'local' } } },
-      expect.objectContaining({ refreshInterval: 60_000 })
     );
   });
 
