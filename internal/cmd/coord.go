@@ -138,6 +138,11 @@ func newCoordinator(
 
 	// Determine advertise address for service registry
 	advertiseAddr := cfg.Coordinator.Advertise
+	if advertiseAddr == "" && isLoopbackHost(cfg.Coordinator.Host) {
+		// A loopback listener is reachable only through loopback, while the
+		// hostname may resolve to another interface (e.g. a public IPv6).
+		advertiseAddr = cfg.Coordinator.Host
+	}
 	if advertiseAddr == "" {
 		// No advertise address specified, try auto-detection
 		if hostname != "unknown" {
@@ -270,4 +275,13 @@ func loadCoordinatorTLSCredentials(tlsConfig *config.TLSConfig) (credentials.Tra
 	}
 
 	return credentials.NewTLS(config), nil
+}
+
+// isLoopbackHost reports whether host names only the loopback interface.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

@@ -97,3 +97,14 @@ func TestCloudReportEvents(t *testing.T) {
 		require.Equal(t, runs, events.Statuses)
 	}
 }
+
+// A coordinator bound to loopback must advertise that address, not the
+// hostname, which may resolve to an interface it does not listen on.
+func TestIsLoopbackHost(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+		require.True(t, isLoopbackHost(host), host)
+	}
+	for _, host := range []string{"0.0.0.0", "", "192.168.1.5", "my-pc"} {
+		require.False(t, isLoopbackHost(host), host)
+	}
+}
