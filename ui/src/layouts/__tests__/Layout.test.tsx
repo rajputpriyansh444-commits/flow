@@ -19,16 +19,6 @@ import { I18nProvider } from '@/i18n/I18nProvider';
 import { dispatchHandledEscape } from '@/test/keyboard';
 import Layout from '../Layout';
 
-vi.mock('@/components/LicenseBadge', () => ({ LicenseBadge: () => null }));
-
-vi.mock('@/components/LicenseBanner', () => ({
-  LicenseBanner: () => <div data-testid="license-banner" />,
-}));
-
-vi.mock('@/components/MonitoringNotice', () => ({
-  MonitoringNotice: () => <div data-testid="monitoring-notice" />,
-}));
-
 vi.mock('@/components/UpdateBanner', () => ({
   UpdateBanner: () => <div data-testid="update-banner" />,
 }));
@@ -268,7 +258,6 @@ describe('Layout', () => {
       screen.getByRole('navigation', { name: 'breadcrumb' })
     ).toBeInTheDocument();
     expect(screen.getByTestId('update-banner')).toBeInTheDocument();
-    expect(screen.getByTestId('license-banner')).toBeInTheDocument();
     expect(screen.getByTestId('scheduler-pause-banner')).toBeInTheDocument();
   });
 
@@ -294,7 +283,6 @@ describe('Layout', () => {
       screen.queryByRole('link', { name: 'Content home' })
     ).not.toBeInTheDocument();
     expect(screen.getByTestId('update-banner')).toBeInTheDocument();
-    expect(screen.getByTestId('license-banner')).toBeInTheDocument();
     expect(screen.getByTestId('scheduler-pause-banner')).toBeInTheDocument();
   });
 
@@ -324,14 +312,8 @@ describe('Layout', () => {
     ).toBeInTheDocument();
   });
 
-  it('leaves license and monitoring notices to the license page', () => {
-    const { unmount } = renderLayout('/home');
-    expect(screen.getByTestId('license-banner')).toBeInTheDocument();
-    expect(screen.getByTestId('monitoring-notice')).toBeInTheDocument();
-    unmount();
-
-    renderLayout('/license');
-    expect(screen.queryByTestId('license-banner')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('monitoring-notice')).not.toBeInTheDocument();
+  it('shows no license or monitoring notice', () => {
+    renderLayout('/home');
+    expect(screen.queryByText(/license|monitoring/i)).not.toBeInTheDocument();
   });
 });

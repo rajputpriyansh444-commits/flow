@@ -593,7 +593,7 @@ describe('LicensePage', () => {
       within(rbac).getByRole('link', { name: 'Setup guide' })
     ).toHaveAttribute(
       'href',
-      'https://docs.example.com/server-admin/authentication/builtin'
+      '/users'
     );
   });
 
@@ -1758,7 +1758,7 @@ describe('LicensePage', () => {
       expect(row('Status')).toHaveTextContent('Community');
       expect(
         within(row('Status')).getByRole('link', { name: 'View plans' })
-      ).toHaveAttribute('href', expect.stringContaining('flow.sh/pricing'));
+      ).toHaveAttribute('href', '/license');
       expect(row('Connection')).toHaveTextContent('Not connected');
       expect(callouts()).toHaveLength(0);
       expect(

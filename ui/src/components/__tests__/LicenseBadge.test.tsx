@@ -191,7 +191,7 @@ describe('license presentation', () => {
     ).toHaveAttribute('href', '/license?trial=1#monitoring');
     expect(screen.getByRole('link', { name: 'View plans' })).toHaveAttribute(
       'href',
-      expect.stringContaining('content=audit')
+      '/license'
     );
     view.unmount();
 
@@ -209,7 +209,7 @@ describe('license presentation', () => {
     renderLicense({ valid: false });
     expect(screen.getByRole('link', { name: 'Renew license' })).toHaveAttribute(
       'href',
-      expect.stringContaining('https://console.example.com/')
+      '/license'
     );
   });
 

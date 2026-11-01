@@ -59,13 +59,8 @@ describe('GettingStartedChecklist', () => {
       })
     ).toBeVisible();
     expect(
-      within(stepItem('Put a workflow on a schedule')).getByRole('link', {
-        name: 'Scheduling guide',
-      })
-    ).toHaveAttribute(
-      'href',
-      'https://docs.example.com/writing-workflows/scheduling'
-    );
+      within(stepItem('Put a workflow on a schedule')).queryByRole('link')
+    ).not.toBeInTheDocument();
     const alert = within(stepItem('Get alerted when something fails'));
     expect(
       alert.getByRole('link', { name: 'Connect for free' })

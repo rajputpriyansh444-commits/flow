@@ -462,7 +462,6 @@ const baseEnglish = {
   Connections: 'Connections',
   'Connections are configured once, then selected by Global, workspace, or workflow incident routing.':
     'Connections are configured once, then selected by Global, workspace, or workflow incident routing.',
-  'console.flow.sh': 'console.flow.sh',
   'Continue scanning': 'Continue scanning',
   'Coordinator Service': 'Coordinator Service',
   Copied: 'Copied',
@@ -3463,7 +3462,6 @@ const baseChinese = {
   Connections: '连接',
   'Connections are configured once, then selected by Global, workspace, or workflow incident routing.':
     '连接只需配置一次，随后通过全局、工作区或工作流事件路由进行选择。',
-  'console.flow.sh': 'console.flow.sh',
   'Continue scanning': '继续扫描',
   'Coordinator Service': '协调服务',
   Copied: '已复制',
@@ -6396,7 +6394,6 @@ const baseJapanese = {
   Connections: '接続',
   'Connections are configured once, then selected by Global, workspace, or workflow incident routing.':
     '接続は一度設定され、その後グローバル、ワークスペース、またはワークフローのインシデントルーティングによって選択されます。',
-  'console.flow.sh': 'console.flow.sh',
   'Continue scanning': 'スキャンを続行',
   'Coordinator Service': 'コーディネーターサービス',
   Copied: 'コピーしました',
